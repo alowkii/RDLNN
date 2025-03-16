@@ -5,13 +5,14 @@ import numpy as np
 import time
 from pathlib import Path
 import gc
-
-from modules.BatchFeatureExtractor import OptimizedBatchProcessor
-from modules.rdlnn import RegressionDLNN
-from modules.preprocessing import preprocess_image
-
+import matplotlib.pyplot as plt
 import signal
 import sys
+
+# Import the improved modules
+from modules.rdlnn import RegressionDLNN
+from modules.data_handling import precompute_features, load_and_verify_features
+from modules.preprocessing import preprocess_image
 
 def signal_handler(sig, frame):
     print('Cleaning up resources before exit...')
@@ -26,8 +27,8 @@ signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
 
 def main():
     parser = argparse.ArgumentParser(description='Image Forgery Detection System')
-    parser.add_argument('--mode', choices=['train', 'test', 'precompute', 'single'], required=True, 
-                        help='Operating mode: train, test, precompute features, or single image test')
+    parser.add_argument('--mode', choices=['train', 'test', 'precompute', 'single', 'analyze'], required=True, 
+                        help='Operating mode: train, test, precompute features, single image test, or analyze features')
     parser.add_argument('--input_dir', type=str,
                         help='Directory containing input images')
     parser.add_argument('--image_path', type=str,
@@ -65,71 +66,89 @@ def main():
     print(f"Using device: {device}")
     
     if args.mode == 'precompute':
-        precompute_features(args)
+        precompute_mode(args)
     elif args.mode == 'train':
-        train_model(args)
+        train_mode(args)
     elif args.mode == 'test':
-        test_model(args)
+        test_mode(args)
     elif args.mode == 'single':
         test_single_image(args)
+    elif args.mode == 'analyze':
+        analyze_features(args)
 
-def precompute_features(args):
+def precompute_mode(args):
     """Precompute features for training or testing"""
     print(f"Precomputing features with batch size {args.batch_size}...")
     
-    # Initialize the batch processor
-    processor = OptimizedBatchProcessor(
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        use_fp16=args.fp16
-    )
-    
     # Process authentic images if provided
-    authentic_features = None
     if args.authentic_dir:
         print(f"\nProcessing authentic images from {args.authentic_dir}")
-        authentic_features = processor.precompute_features(
+        authentic_features = precompute_features(
             directory=args.authentic_dir,
             label=0,  # 0 = authentic
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            use_fp16=args.fp16,
             save_path=f"{os.path.splitext(args.features_path)[0]}_authentic.npz"
         )
     
     # Process forged images if provided
-    forged_features = None
     if args.forged_dir:
         print(f"\nProcessing forged images from {args.forged_dir}")
-        forged_features = processor.precompute_features(
+        forged_features = precompute_features(
             directory=args.forged_dir,
             label=1,  # 1 = forged
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            use_fp16=args.fp16,
             save_path=f"{os.path.splitext(args.features_path)[0]}_forged.npz"
         )
     
     # Process general input directory if provided
     if args.input_dir and args.input_dir != args.authentic_dir and args.input_dir != args.forged_dir:
         print(f"\nProcessing images from {args.input_dir}")
-        processor.precompute_features(
+        precompute_features(
             directory=args.input_dir,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            use_fp16=args.fp16,
             save_path=args.features_path
         )
     
     # Combine authentic and forged features if both were computed
-    if authentic_features and forged_features:
+    if args.authentic_dir and args.forged_dir:
         print("\nCombining authentic and forged features...")
-        combined_features = {
-            'paths': authentic_features['paths'] + forged_features['paths'],
-            'features': np.vstack([authentic_features['features'], forged_features['features']]),
-            'labels': authentic_features['labels'] + forged_features['labels']
-        }
+        # Load the individual feature files
+        authentic_data = np.load(f"{os.path.splitext(args.features_path)[0]}_authentic.npz")
+        forged_data = np.load(f"{os.path.splitext(args.features_path)[0]}_forged.npz")
         
+        # Extract data
+        authentic_features = authentic_data['features']
+        authentic_paths = authentic_data['paths']
+        authentic_labels = authentic_data['labels']
+        
+        forged_features = forged_data['features']
+        forged_paths = forged_data['paths']
+        forged_labels = forged_data['labels']
+        
+        # Combine the data
+        combined_features = np.vstack([authentic_features, forged_features])
+        combined_paths = list(authentic_paths) + list(forged_paths)
+        combined_labels = list(authentic_labels) + list(forged_labels)
+        
+        # Save combined data
         np.savez(
             args.features_path,
-            paths=combined_features['paths'],
-            features=combined_features['features'],
-            labels=combined_features['labels']
+            features=combined_features,
+            paths=combined_paths,
+            labels=combined_labels
         )
+        
         print(f"Saved combined features to {args.features_path}")
+        print(f"Combined dataset: {len(combined_features)} samples "
+              f"({len(authentic_features)} authentic, {len(forged_features)} forged)")
 
-def train_model(args):
+def train_mode(args):
     """Train the model using precomputed features"""
     if not (args.authentic_dir and args.forged_dir) and not os.path.exists(args.features_path):
         print("Error: For training, either provide authentic_dir and forged_dir arguments, "
@@ -139,100 +158,148 @@ def train_model(args):
     # Load or compute features
     if not os.path.exists(args.features_path):
         print("Precomputing features for training...")
-        precompute_features(args)
+        precompute_mode(args)
     
-    print(f"Loading precomputed features from {args.features_path}...")
-    data = np.load(args.features_path)
-    features = data['features']
-    labels = data['labels']
-    paths = data['paths']
-
-    # Filter to keep only samples with valid features and labels
-    valid_indices = []
-    for i in range(len(labels)):
-        # Check if both feature and label exist and are valid
-        if i < len(features) and not np.isnan(features[i]).any() and i < len(labels) and not np.isnan(labels[i]):
-            valid_indices.append(i)
-
-    # Apply filtering
-    filtered_features = features[valid_indices]
-    filtered_labels = np.array(labels)[valid_indices]
-    filtered_paths = [paths[i] for i in valid_indices]
-
-    print(f"Original dataset size: {len(features)} samples")
-    print(f"Filtered dataset size: {len(filtered_features)} samples")
-
-    # Update the references for further processing
-    features = filtered_features
-    labels = filtered_labels
+    # Load and verify features
+    features, labels, paths = load_and_verify_features(args.features_path)
     
-    try:
-        # Convert to torch tensors
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        X = torch.tensor(features, dtype=torch.float32, device=device)
-        y = torch.tensor(labels, dtype=torch.float32, device=device).unsqueeze(1)
-        
-        # Create and train the model
-        input_dim = features.shape[1]
-        model = RegressionDLNN(input_dim)
-        model.fit(
-            X, y, 
-            epochs=args.epochs, 
-            learning_rate=args.learning_rate,
-            batch_size=args.batch_size,
-            validation_split=0.4,  # Increased from 0.2
-            early_stopping=3,  # Reduced from 10
-            use_fp16=args.fp16
-        )
-        
-        # Save the model
-        model.save(args.model_path)
-        print(f"Model saved to {args.model_path}")
-    finally:
-        # Ensure cleanup of CUDA resources
-        if torch.cuda.is_available():
-            # Delete tensors explicitly
-            if 'X' in locals():
-                del X
-            if 'y' in locals():
-                del y
-            if 'model' in locals():
-                del model
-            # Clear CUDA cache and wait for all operations to complete
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        # Force garbage collection
-        gc.collect()
+    if len(features) == 0:
+        print("Error: No valid features found. Please check your data.")
+        return
+    
+    if len(labels) == 0:
+        print("Error: No labels found. Please make sure your feature file includes labels.")
+        return
+    
+    # Check class balance
+    class_counts = np.bincount(labels.astype(int))
+    if len(class_counts) < 2:
+        print(f"Error: Only found {len(class_counts)} classes. Need at least 2 classes for training.")
+        return
+    
+    # Create and train the model
+    input_dim = features.shape[1]
+    print(f"Creating model with input dimension: {input_dim}")
+    model = RegressionDLNN(input_dim)
+    
+    # Train the model
+    history = model.fit(
+        features, labels, 
+        epochs=args.epochs, 
+        learning_rate=args.learning_rate,
+        batch_size=args.batch_size,
+        validation_split=0.2,
+        early_stopping=5,
+        use_fp16=args.fp16
+    )
+    
+    # Save the model
+    model.save(args.model_path)
+    
+    # Plot training history
+    plot_history(history, args.output_dir)
 
-def test_model(args):
+def test_mode(args):
     """Test the model on images in the input directory"""
     if not os.path.exists(args.model_path):
         print(f"Error: Model not found at {args.model_path}")
         return
     
+    if not args.input_dir:
+        print("Error: Please provide --input_dir argument for testing")
+        return
+    
     # Load the model
     model = RegressionDLNN.load(args.model_path)
     
-    # Initialize the batch processor with the loaded model
-    processor = OptimizedBatchProcessor(
-        model=model,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        use_fp16=args.fp16
-    )
+    # Precompute features if not already done
+    features_file = args.features_path
+    if not os.path.exists(features_file):
+        print("Precomputing features for test images...")
+        precompute_features(
+            directory=args.input_dir,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            use_fp16=args.fp16,
+            save_path=features_file
+        )
     
-    print(f"Processing images from {args.input_dir}...")
+    # Load features
+    test_features, test_labels, test_paths = load_and_verify_features(features_file)
+    
+    if len(test_features) == 0:
+        print("Error: No valid features found for testing.")
+        return
+    
+    # Make predictions
     start_time = time.time()
-    
-    # Process all images in the directory
-    results_file = os.path.join(args.output_dir, 'detection_results.txt')
-    results = processor.process_directory(
-        directory=args.input_dir,
-        results_file=results_file
-    )
-    
+    predictions, confidences = model.predict(test_features)
     elapsed_time = time.time() - start_time
-    print(f"Processing completed in {elapsed_time:.2f} seconds")
+    
+    # Process results
+    results = {
+        'authentic': [],
+        'forged': [],
+        'errors': []
+    }
+    
+    # Create detailed results output
+    results_file = os.path.join(args.output_dir, 'detection_results.txt')
+    with open(results_file, 'w') as f:
+        f.write("Image Forgery Detection Results\n")
+        f.write("==============================\n\n")
+        
+        for i, (path, pred, conf) in enumerate(zip(test_paths, predictions, confidences)):
+            img_name = os.path.basename(path)
+            result_type = 'forged' if pred == 1 else 'authentic'
+            results[result_type].append(img_name)
+            
+            f.write(f"Image: {img_name}\n")
+            f.write(f"Result: {result_type.upper()}\n")
+            f.write(f"Confidence: {conf:.4f}\n")
+            
+            if i < len(test_labels):
+                true_label = 'forged' if test_labels[i] == 1 else 'authentic'
+                f.write(f"True label: {true_label.upper()}\n")
+                if pred == test_labels[i]:
+                    f.write("Prediction: CORRECT\n")
+                else:
+                    f.write("Prediction: INCORRECT\n")
+            
+            f.write("\n")
+    
+    # Print summary
+    print("\nProcessing complete!")
+    print(f"Processed {len(predictions)} images in {elapsed_time:.2f} seconds")
+    print(f"Authentic images: {len(results['authentic'])}")
+    print(f"Forged images: {len(results['forged'])}")
+    
+    # Compute accuracy if we have labels
+    if len(test_labels) > 0:
+        accuracy = np.mean(predictions == test_labels)
+        print(f"Accuracy: {accuracy:.4f}")
+        
+        # Compute confusion matrix
+        tp = np.sum((predictions == 1) & (test_labels == 1))
+        tn = np.sum((predictions == 0) & (test_labels == 0))
+        fp = np.sum((predictions == 1) & (test_labels == 0))
+        fn = np.sum((predictions == 0) & (test_labels == 1))
+        
+        print("\nConfusion Matrix:")
+        print(f"True Positive: {tp}")
+        print(f"True Negative: {tn}")
+        print(f"False Positive: {fp}")
+        print(f"False Negative: {fn}")
+        
+        # Calculate precision, recall, and F1 score
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+    
     print(f"Results saved to {results_file}")
 
 def test_single_image(args):
@@ -252,68 +319,202 @@ def test_single_image(args):
     # Load the model
     model = RegressionDLNN.load(args.model_path)
     
-    # Initialize the batch processor with the loaded model
-    processor = OptimizedBatchProcessor(
-        model=model,
-        batch_size=1,  # Set to 1 for single image
-        num_workers=1,
-        use_fp16=args.fp16
-    )
-    
+    # Process the image
     print(f"Processing single image: {args.image_path}")
     start_time = time.time()
     
-    # Create a temporary directory with the image
-    temp_dir = os.path.join(args.output_dir, 'temp_single_image')
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # Copy the image to the temporary directory
-    import shutil
-    image_name = os.path.basename(args.image_path)
-    temp_image_path = os.path.join(temp_dir, image_name)
-    shutil.copy2(args.image_path, temp_image_path)
-    
     try:
-        # Process the image
-        features = processor._process_image_batch([args.image_path])
+        # Preprocess the image
+        ycbcr_tensor = preprocess_image(args.image_path)
         
-        if features is not None and len(features) > 0:
-            # Make prediction
-            predictions, confidences = processor.batch_predict(features)
-            
-            if predictions is not None and len(predictions) > 0:
-                # Display results
-                prediction = predictions[0]
-                confidence = confidences[0]
-                result = "FORGED" if prediction == 1 else "AUTHENTIC"
-                
-                print(f"\nResult: {result}")
-                print(f"Confidence: {confidence:.4f}")
-                print(f"Prediction value: {prediction}")
-                
-                # Save the result
-                result_file = os.path.join(args.output_dir, f"{os.path.splitext(image_name)[0]}_result.txt")
-                with open(result_file, 'w') as f:
-                    f.write(f"Image: {args.image_path}\n")
-                    f.write(f"Result: {result}\n")
-                    f.write(f"Confidence: {confidence:.4f}\n")
-                    f.write(f"Prediction value: {prediction}\n")
-                
-                print(f"Result saved to {result_file}")
-            else:
-                print("Failed to make prediction")
-        else:
-            print("Failed to extract features")
-    
+        if ycbcr_tensor is None:
+            print("Error: Failed to preprocess image")
+            return
+        
+        # Add batch dimension
+        ycbcr_tensor = ycbcr_tensor.unsqueeze(0)
+        
+        # Apply wavelet transform
+        from modules.imageDecomposition import polar_dyadic_wavelet_transform
+        pdywt_coeffs = polar_dyadic_wavelet_transform(ycbcr_tensor[0])
+        
+        # Extract features
+        from modules.featureExtraction import BatchFeatureExtractor
+        feature_extractor = BatchFeatureExtractor(
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            batch_size=1,
+            num_workers=1,
+            use_fp16=args.fp16
+        )
+        
+        feature_vector = feature_extractor.extract_batch_features(
+            ycbcr_tensor, [pdywt_coeffs]
+        )
+        
+        if feature_vector is None:
+            print("Error: Failed to extract features")
+            return
+        
+        # Make prediction
+        predictions, confidences = model.predict(feature_vector.cpu().numpy())
+        
+        # Display results
+        prediction = predictions[0]
+        confidence = confidences[0]
+        result = "FORGED" if prediction == 1 else "AUTHENTIC"
+        
+        print(f"\nResult: {result}")
+        print(f"Confidence: {confidence:.4f}")
+        
+        # Save the result
+        result_file = os.path.join(args.output_dir, f"{os.path.splitext(os.path.basename(args.image_path))[0]}_result.txt")
+        with open(result_file, 'w') as f:
+            f.write(f"Image: {args.image_path}\n")
+            f.write(f"Result: {result}\n")
+            f.write(f"Confidence: {confidence:.4f}\n")
+        
+        print(f"Result saved to {result_file}")
+        
     except Exception as e:
         print(f"Error processing image: {e}")
     
-    finally:
-        # Clean up temporary directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
-    
     elapsed_time = time.time() - start_time
     print(f"Processing completed in {elapsed_time:.2f} seconds")
+
+def analyze_features(args):
+    """Analyze precomputed features to gain insights"""
+    if not os.path.exists(args.features_path):
+        print(f"Error: Features file not found at {args.features_path}")
+        return
+    
+    # Load features
+    features, labels, paths = load_and_verify_features(args.features_path)
+    
+    if len(features) == 0:
+        print("Error: No valid features found for analysis.")
+        return
+    
+    if len(labels) == 0:
+        print("Error: No labels found. Feature analysis requires labeled data.")
+        return
+    
+    print("\nFeature Analysis:")
+    print("================")
+    
+    # Split features by class
+    authentic_features = features[labels == 0]
+    forged_features = features[labels == 1]
+    
+    print(f"Authentic samples: {len(authentic_features)}")
+    print(f"Forged samples: {len(forged_features)}")
+    
+    # Compute feature statistics by class
+    authentic_mean = np.mean(authentic_features, axis=0)
+    forged_mean = np.mean(forged_features, axis=0)
+    
+    # Find most discriminative features
+    feature_diff = np.abs(authentic_mean - forged_mean)
+    top_features = np.argsort(-feature_diff)[:10]  # Top 10 features
+    
+    print("\nTop 10 most discriminative features:")
+    for i, feature_idx in enumerate(top_features):
+        print(f"{i+1}. Feature {feature_idx}: "
+              f"Auth={authentic_mean[feature_idx]:.4f}, "
+              f"Forged={forged_mean[feature_idx]:.4f}, "
+              f"Diff={feature_diff[feature_idx]:.4f}")
+    
+    # Plot feature distributions
+    plt.figure(figsize=(15, 10))
+    
+    # Plot mean feature values
+    plt.subplot(2, 1, 1)
+    plt.plot(authentic_mean, 'b-', alpha=0.7, label='Authentic')
+    plt.plot(forged_mean, 'r-', alpha=0.7, label='Forged')
+    plt.title('Mean Feature Values by Class')
+    plt.xlabel('Feature Index')
+    plt.ylabel('Mean Value')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot feature difference
+    plt.subplot(2, 1, 2)
+    plt.bar(range(len(feature_diff)), feature_diff)
+    plt.title('Absolute Difference in Feature Means')
+    plt.xlabel('Feature Index')
+    plt.ylabel('Absolute Difference')
+    plt.grid(True, alpha=0.3)
+    
+    # Highlight top discriminative features
+    for feature_idx in top_features:
+        plt.axvline(x=feature_idx, color='r', linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    analysis_file = os.path.join(args.output_dir, 'feature_analysis.png')
+    plt.savefig(analysis_file)
+    print(f"\nFeature analysis plot saved to {analysis_file}")
+    
+    # PCA visualization if we have enough samples
+    if len(features) > 2:
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+        
+        # Standardize the features
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+        
+        # Apply PCA
+        pca = PCA(n_components=2)
+        features_pca = pca.fit_transform(features_scaled)
+        
+        # Plot PCA
+        plt.figure(figsize=(10, 8))
+        plt.scatter(features_pca[labels == 0, 0], features_pca[labels == 0, 1], 
+                    c='blue', marker='o', alpha=0.7, label='Authentic')
+        plt.scatter(features_pca[labels == 1, 0], features_pca[labels == 1, 1], 
+                    c='red', marker='x', alpha=0.7, label='Forged')
+        plt.title('PCA Visualization of Features')
+        plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+        plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Save the PCA plot
+        pca_file = os.path.join(args.output_dir, 'pca_visualization.png')
+        plt.savefig(pca_file)
+        print(f"PCA visualization saved to {pca_file}")
+
+def plot_history(history, output_dir):
+    """Plot training history"""
+    plt.figure(figsize=(12, 5))
+    
+    # Plot loss
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_loss'], label='Train')
+    plt.plot(history['val_loss'], label='Validation')
+    plt.title('Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot accuracy
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_acc'], label='Train')
+    plt.plot(history['val_acc'], label='Validation')
+    plt.title('Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    history_file = os.path.join(output_dir, 'training_history.png')
+    plt.savefig(history_file)
+    print(f"Training history plot saved to {history_file}")
 
 if __name__ == "__main__":
     main()
