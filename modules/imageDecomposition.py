@@ -1,159 +1,156 @@
 import numpy as np
 import pywt
-import cv2
-import math
-import cupy as cp
 import torch
+import cupy as cp
 from cupyx.scipy.ndimage import gaussian_filter
 
 def polar_dyadic_wavelet_transform(ycbcr_img):
     """
-    Implement GPU-only Polar Dyadic Wavelet Transform (PDyWT) to decompose the image
-    PDyWT keeps image size constant at different levels and provides better analysis
+    Implement GPU-accelerated Polar Dyadic Wavelet Transform (PDyWT)
     
     Args:
-        ycbcr_img: YCbCr preprocessed image (can be torch.Tensor or numpy array)
+        ycbcr_img: YCbCr preprocessed image as torch.Tensor [C, H, W]
         
     Returns:
-        Decomposed image with wavelet coefficients
+        Dictionary with decomposed wavelet coefficients for all channels
     """
     try:
         # Check if GPU is available
-        if not cp.cuda.is_available():
-            raise RuntimeError("CUDA GPU not available")
+        if not torch.cuda.is_available() or not cp.cuda.is_available():
+            raise RuntimeError("CUDA GPU not available for CuPy or PyTorch")
         
         # Convert input to numpy if it's a torch tensor
         if isinstance(ycbcr_img, torch.Tensor):
             # Move tensor to CPU and convert to numpy
             if ycbcr_img.is_cuda:
                 ycbcr_img = ycbcr_img.cpu()
-            ycbcr_img = ycbcr_img.numpy()
-            # Ensure channel dimension is last (convert from CxHxW to HxWxC)
-            if ycbcr_img.shape[0] == 3:  # If in format CxHxW
-                ycbcr_img = np.transpose(ycbcr_img, (1, 2, 0))
-        
-        # Transfer image to GPU
-        ycbcr_img_gpu = cp.asarray(ycbcr_img)
-        
-        # Split YCbCr channels on GPU
-        # Extract each channel (assuming HxWxC format)
-        y_channel_gpu = ycbcr_img_gpu[:, :, 0]
-        cb_channel_gpu = ycbcr_img_gpu[:, :, 1]
-        cr_channel_gpu = ycbcr_img_gpu[:, :, 2]
-        
-        # Ensure dimensions are even for consistent processing
-        h, w = y_channel_gpu.shape
-        
-        # Always pad to ensure dimensions are even and consistent
-        # This also helps avoid broadcasting errors
-        y_channel_gpu = cp.pad(y_channel_gpu, ((0, (h % 2) + 2), (0, (w % 2) + 2)), 'reflect')
-        cb_channel_gpu = cp.pad(cb_channel_gpu, ((0, (h % 2) + 2), (0, (w % 2) + 2)), 'reflect')
-        cr_channel_gpu = cp.pad(cr_channel_gpu, ((0, (h % 2) + 2), (0, (w % 2) + 2)), 'reflect')
-        
-        new_h, new_w = y_channel_gpu.shape
-        
-        # Calculate appropriate wavelet decomposition level based on image size
-        max_level = min(pywt.dwt_max_level(min(y_channel_gpu.shape), pywt.Wavelet('db1').dec_len), 4)
-        level = min(1, max_level)  # Use at least level 1, but don't exceed max_level
-        
-        # Apply GPU-based stationary wavelet transform
-        coeffs_y = _gpu_swt2(y_channel_gpu, level)
-        coeffs_cb = _gpu_swt2(cb_channel_gpu, level)
-        coeffs_cr = _gpu_swt2(cr_channel_gpu, level)
-        
-        # Extract approximate (LL) and detail coefficients (LH, HL, HH)
-        ll_y, lh_y, hl_y, hh_y = coeffs_y
-        ll_cb, lh_cb, hl_cb, hh_cb = coeffs_cb
-        ll_cr, lh_cr, hl_cr, hh_cr = coeffs_cr
-        
-        # Convert to polar form for better coordinate values using GPU
-        def to_polar_gpu(coeff_gpu):
-            h, w = coeff_gpu.shape
+            ycbcr_np = ycbcr_img.numpy()
+        else:
+            ycbcr_np = ycbcr_img
             
-            # Get center of the image
-            center_y, center_x = h // 2, w // 2
-            
-            # Create coordinate grids
-            y_coords, x_coords = cp.mgrid[0:h, 0:w]
-            
-            # Calculate polar coordinates
-            r = cp.sqrt((y_coords - center_y)**2 + (x_coords - center_x)**2)
-            theta = cp.arctan2(y_coords - center_y, x_coords - center_x)
-            
-            # Map polar coordinates to image values (vectorized operation)
-            scaling_factor = r / max(h, w)
-            polar_coeff_gpu = coeff_gpu * scaling_factor
-            
-            return polar_coeff_gpu
-    
-        # Apply polar transformation to wavelet coefficients
-        polar_ll_y = to_polar_gpu(ll_y)
-        polar_lh_y = to_polar_gpu(lh_y)
-        polar_hl_y = to_polar_gpu(hl_y)
-        polar_hh_y = to_polar_gpu(hh_y)
+        # Handle different tensor formats
+        if ycbcr_np.ndim == 3 and ycbcr_np.shape[0] == 3:  # [C, H, W] format
+            # Rearrange to [H, W, C] for processing
+            ycbcr_np = np.transpose(ycbcr_np, (1, 2, 0))
         
-        polar_ll_cb = to_polar_gpu(ll_cb)
-        polar_lh_cb = to_polar_gpu(lh_cb)
-        polar_hl_cb = to_polar_gpu(hl_cb)
-        polar_hh_cb = to_polar_gpu(hh_cb)
+        # Transfer image to GPU using CuPy
+        ycbcr_gpu = cp.asarray(ycbcr_np, dtype=cp.float32)
         
-        polar_ll_cr = to_polar_gpu(ll_cr)
-        polar_lh_cr = to_polar_gpu(lh_cr)
-        polar_hl_cr = to_polar_gpu(hl_cr)
-        polar_hh_cr = to_polar_gpu(hh_cr)
+        # Split YCbCr channels 
+        if ycbcr_gpu.ndim == 3 and ycbcr_gpu.shape[2] == 3:
+            y_channel = ycbcr_gpu[:, :, 0]
+            cb_channel = ycbcr_gpu[:, :, 1]
+            cr_channel = ycbcr_gpu[:, :, 2]
+        else:
+            raise ValueError(f"Expected 3-channel image, got shape {ycbcr_gpu.shape}")
         
-        # Keep the results on GPU
-        polar_coeffs = {
-            'y': (polar_ll_y, (polar_lh_y, polar_hl_y, polar_hh_y)),
-            'cb': (polar_ll_cb, (polar_lh_cb, polar_hl_cb, polar_hh_cb)),
-            'cr': (polar_ll_cr, (polar_lh_cr, polar_hl_cr, polar_hh_cr))
+        # Make dimensions even for wavelet transform
+        h, w = y_channel.shape
+        h_pad, w_pad = (h % 2), (w % 2)
+        
+        # Apply padding if needed
+        if h_pad != 0 or w_pad != 0:
+            y_channel = cp.pad(y_channel, ((0, h_pad), (0, w_pad)), mode='reflect')
+            cb_channel = cp.pad(cb_channel, ((0, h_pad), (0, w_pad)), mode='reflect') 
+            cr_channel = cp.pad(cr_channel, ((0, h_pad), (0, w_pad)), mode='reflect')
+        
+        # Get updated dimensions
+        h, w = y_channel.shape
+        
+        # Apply GPU-based wavelet transform
+        coeffs_y = _gpu_swt2(y_channel)
+        coeffs_cb = _gpu_swt2(cb_channel)
+        coeffs_cr = _gpu_swt2(cr_channel)
+        
+        # Apply polar transformation
+        polar_coeffs_y = _transform_to_polar(coeffs_y)
+        polar_coeffs_cb = _transform_to_polar(coeffs_cb)
+        polar_coeffs_cr = _transform_to_polar(coeffs_cr)
+        
+        # Return dictionary with coefficients
+        return {
+            'y': polar_coeffs_y,
+            'cb': polar_coeffs_cb,
+            'cr': polar_coeffs_cr
         }
-        
-        return polar_coeffs
-        
+    
     except Exception as e:
-        print(f"Error in GPU polar dyadic wavelet transform: {e}")
+        print(f"Error in polar dyadic wavelet transform: {e}")
         raise e
 
-def _gpu_swt2(data_gpu, level):
+def _gpu_swt2(data_gpu):
     """
-    GPU implementation of the stationary wavelet transform (SWT2)
-    Simplified implementation using GPU-accelerated filters
+    GPU implementation of stationary wavelet transform
     
     Args:
-        data_gpu: CuPy array of image data
-        level: Decomposition level
+        data_gpu: 2D CuPy array
         
     Returns:
-        Tuple of approximation and detail coefficients
+        Tuple of (LL, LH, HL, HH) wavelet coefficients
     """
-    # Define Haar wavelet filter coefficients
-    low_filter = cp.array([0.5, 0.5])
-    high_filter = cp.array([0.5, -0.5])
+    # Haar wavelet filters
+    low_filter = cp.asarray([0.5, 0.5], dtype=cp.float32)
+    high_filter = cp.asarray([0.5, -0.5], dtype=cp.float32)
     
-    # Using CuPy's FFT-based convolution for better stability
-    # This avoids shape broadcasting issues
-    def apply_filter(data, filter_y, filter_x):
-        # Use cuFFT-based convolution
-        return cp.fft.ifft2(cp.fft.fft2(data) * cp.fft.fft2(filter_y * filter_x, s=data.shape)).real
-    
-    # Create 2D filters with proper padding to match input size
+    # Create 2D separable filters
     h, w = data_gpu.shape
-    low_low = cp.zeros((h, w), dtype=cp.float32)
-    low_high = cp.zeros((h, w), dtype=cp.float32)
-    high_low = cp.zeros((h, w), dtype=cp.float32)
-    high_high = cp.zeros((h, w), dtype=cp.float32)
+    filter_size = 2
     
-    # Set the center elements to create proper 2D filters
-    low_low[h//2-1:h//2+1, w//2-1:w//2+1] = cp.outer(low_filter, low_filter)
-    low_high[h//2-1:h//2+1, w//2-1:w//2+1] = cp.outer(low_filter, high_filter)
-    high_low[h//2-1:h//2+1, w//2-1:w//2+1] = cp.outer(high_filter, low_filter)
-    high_high[h//2-1:h//2+1, w//2-1:w//2+1] = cp.outer(high_filter, high_filter)
+    # Function to apply separable convolution
+    def apply_separable_filter(data, filter_x, filter_y):
+        # Apply horizontal filter
+        temp = cp.zeros_like(data)
+        for i in range(filter_size):
+            if i < len(filter_x):
+                temp += cp.roll(data, i - filter_size//2, axis=1) * filter_x[i]
+        
+        # Apply vertical filter to temp result
+        result = cp.zeros_like(temp)
+        for i in range(filter_size):
+            if i < len(filter_y):
+                result += cp.roll(temp, i - filter_size//2, axis=0) * filter_y[i]
+        
+        return result
     
-    # Apply convolution
-    ll = apply_filter(data_gpu, low_low, cp.ones_like(low_low))
-    lh = apply_filter(data_gpu, low_high, cp.ones_like(low_high))
-    hl = apply_filter(data_gpu, high_low, cp.ones_like(high_low))
-    hh = apply_filter(data_gpu, high_high, cp.ones_like(high_high))
+    # Apply filters to get wavelet coefficients
+    ll = apply_separable_filter(data_gpu, low_filter, low_filter)
+    lh = apply_separable_filter(data_gpu, low_filter, high_filter)
+    hl = apply_separable_filter(data_gpu, high_filter, low_filter)
+    hh = apply_separable_filter(data_gpu, high_filter, high_filter)
     
     return ll, lh, hl, hh
+
+def _transform_to_polar(coeffs):
+    """
+    Transform wavelet coefficients to polar coordinates
+    
+    Args:
+        coeffs: Tuple of (LL, LH, HL, HH) wavelet coefficients
+        
+    Returns:
+        Tuple of transformed coefficients
+    """
+    ll, lh, hl, hh = coeffs
+    h, w = ll.shape
+    
+    # Create coordinate grid
+    y_coords, x_coords = cp.mgrid[0:h, 0:w]
+    
+    # Find center point
+    center_y, center_x = h // 2, w // 2
+    
+    # Calculate polar coordinates (radius and angle)
+    r = cp.sqrt((y_coords - center_y)**2 + (x_coords - center_x)**2)
+    theta = cp.arctan2(y_coords - center_y, x_coords - center_x)
+    
+    # Normalize radius
+    max_radius = cp.sqrt((h/2)**2 + (w/2)**2)
+    r_norm = r / max_radius
+    
+    # Apply polar weighting to coefficients (radial emphasis)
+    polar_ll = ll * r_norm
+    polar_lh = lh * r_norm
+    polar_hl = hl * r_norm
+    polar_hh = hh * r_norm
+    
+    return polar_ll, polar_lh, polar_hl, polar_hh

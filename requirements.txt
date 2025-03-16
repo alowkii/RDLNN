@@ -1,0 +1,9 @@
+torch>=1.9.0
+torchvision>=0.10.0
+numpy>=1.19.5
+pywt>=1.1.1
+cupy-cuda11>=9.6.0  # Change version based on your CUDA version
+scikit-learn>=0.24.2
+Pillow>=8.3.1
+opencv-python>=4.5.3
+tqdm>=4.62.2
