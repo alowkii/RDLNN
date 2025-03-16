@@ -1,2 +1,6 @@
+# Ignore environment-related files and directories
+.env
 Env/
+
+# Ignore data-related files and directories
 Data/
