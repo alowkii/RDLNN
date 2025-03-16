@@ -2,286 +2,265 @@ import os
 import argparse
 import torch
 import numpy as np
-from tqdm import tqdm
+import time
+from pathlib import Path
+
+from modules.BatchFeatureExtractor import OptimizedBatchProcessor
+from modules.models import RegressionDLNN
 from modules.preprocessing import preprocess_image
-from modules.imageDecomposition import polar_dyadic_wavelet_transform
-from modules.featureExtraction import extract_features
-from modules.rdlnn import RegressionDLNN
-from modules.batch_processing import batch_process_directory
-import gc
-
-def setup_cuda_environment():
-    """Configure CUDA environment for optimal performance"""
-    # Set CUDA device
-    torch.cuda.set_device(0)
-    
-    # Enable TF32 for faster matrix multiplication on Ampere GPUs
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    
-    # Set cudnn benchmark mode for optimal performance
-    torch.backends.cudnn.benchmark = True
-    
-    # Print CUDA information
-    device = torch.cuda.current_device()
-    print(f"Using GPU: {torch.cuda.get_device_name(device)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB")
-    print(f"CUDA Version: {torch.version.cuda}")
-    print(f"PyTorch CUDA: {torch.cuda.is_available()}")
-
-def process_single_image(image_path, model, stream=None):
-    """
-    Process a single image and determine if it's authentic or forged
-    
-    Args:
-        image_path: Path to the image file
-        model: Trained RegressionDLNN model
-        stream: CUDA stream for concurrent processing
-        
-    Returns:
-        (prediction, confidence): Tuple with prediction (0: authentic, 1: forged) and confidence level
-    """
-    try:
-        print(f"Processing image: {image_path}")
-        
-        with torch.cuda.stream(stream) if stream else torch.cuda.stream(torch.cuda.default_stream()):
-            # Preprocess the image to YCbCr
-            ycbcr_img = preprocess_image(image_path)
-            if ycbcr_img is None:
-                print("Failed to preprocess image")
-                return None, 0
-            
-            # Apply polar dyadic wavelet transform
-            pdywt_coeffs = polar_dyadic_wavelet_transform(ycbcr_img)
-            
-            # Convert tensor to dictionary format for feature extraction
-            ycbcr_img_dict = {
-                'y': ycbcr_img[0],
-                'cb': ycbcr_img[1],
-                'cr': ycbcr_img[2]
-            }
-            
-            # Extract features
-            feature_vector = extract_features(pdywt_coeffs, ycbcr_img_dict)
-            
-            # Make prediction
-            prediction, confidence = model.predict(np.array(feature_vector))
-            
-            result = "FORGED" if prediction == 1 else "AUTHENTIC"
-            print(f"Result: {result} (Confidence: {confidence:.2f})")
-            
-            # Synchronize stream to ensure all GPU operations are complete
-            if stream:
-                stream.synchronize()
-            
-        return prediction, confidence
-        
-    except Exception as e:
-        print(f"Error processing image: {e}")
-        return None, 0
-    finally:
-        # Free CUDA memory
-        torch.cuda.empty_cache()
-
-def train_model(train_dir, model_path=None, epochs=50, batch_size=32):
-    """
-    Train the RDLNN model using images from the specified directory
-    
-    Args:
-        train_dir: Directory containing 'authentic' and 'forged' subdirectories with training images
-        model_path: Path to save the trained model
-        epochs: Number of training epochs
-        batch_size: Training batch size
-        
-    Returns:
-        Trained model
-    """
-    # Configure CUDA for optimal training performance
-    torch.backends.cudnn.benchmark = True
-    
-    # Check if required directories exist
-    authentic_dir = os.path.join(train_dir, 'authentic')
-    forged_dir = os.path.join(train_dir, 'forged')
-    
-    if not os.path.exists(authentic_dir) or not os.path.exists(forged_dir):
-        print(f"Training directory must contain 'authentic' and 'forged' subdirectories")
-        return None
-    
-    # Create CUDA streams for parallel processing
-    stream1 = torch.cuda.Stream()
-    stream2 = torch.cuda.Stream()
-    
-    print(f"Extracting features from authentic images...")
-    authentic_features = []
-    authentic_labels = []
-    
-    # Get list of authentic images
-    authentic_images = [img for img in os.listdir(authentic_dir) if img.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    
-    # Process authentic images with progress bar and stream
-    for img_name in tqdm(authentic_images, desc="Processing authentic images"):
-        try:
-            with torch.cuda.stream(stream1):
-                img_path = os.path.join(authentic_dir, img_name)
-                ycbcr_img = preprocess_image(img_path)
-                pdywt_coeffs = polar_dyadic_wavelet_transform(ycbcr_img)
-                
-                ycbcr_img_dict = {
-                    'y': ycbcr_img[0],
-                    'cb': ycbcr_img[1],
-                    'cr': ycbcr_img[2]
-                }
-                
-                feature_vector = extract_features(pdywt_coeffs, ycbcr_img_dict)
-                authentic_features.append(feature_vector)
-                authentic_labels.append(0)  # 0 = authentic
-        except Exception as e:
-            print(f"\nError processing {img_name}: {e}")
-            
-        # Periodically clear cache to prevent OOM errors
-        if len(authentic_features) % 50 == 0:
-            torch.cuda.empty_cache()
-    
-    print(f"Extracting features from forged images...")
-    forged_features = []
-    forged_labels = []
-    
-    # Get list of forged images
-    forged_images = [img for img in os.listdir(forged_dir) if img.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    
-    # Process forged images with progress bar and stream
-    for img_name in tqdm(forged_images, desc="Processing forged images"):
-        try:
-            with torch.cuda.stream(stream2):
-                img_path = os.path.join(forged_dir, img_name)
-                ycbcr_img = preprocess_image(img_path)
-                pdywt_coeffs = polar_dyadic_wavelet_transform(ycbcr_img)
-                
-                ycbcr_img_dict = {
-                    'y': ycbcr_img[0],
-                    'cb': ycbcr_img[1],
-                    'cr': ycbcr_img[2]
-                }
-                
-                feature_vector = extract_features(pdywt_coeffs, ycbcr_img_dict)
-                forged_features.append(feature_vector)
-                forged_labels.append(1)  # 1 = forged
-        except Exception as e:
-            print(f"\nError processing {img_name}: {e}")
-            return None, 0
-        finally:
-            torch.cuda.empty_cache()
-            
-        # Periodically clear cache to prevent OOM errors
-        if len(forged_features) % 50 == 0:
-            torch.cuda.empty_cache()
-    
-    # Combine features and labels
-    X = np.vstack(authentic_features + forged_features)
-    y = np.array(authentic_labels + forged_labels)
-    
-    # Print training data info
-    print(f"Training data: {len(authentic_features)} authentic images, {len(forged_features)} forged images")
-    print(f"Feature vector shape: {X.shape}")
-    
-    # Free memory before training
-    del authentic_features, forged_features
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    # Initialize model with input dimension matching feature vector
-    input_dim = X.shape[1]
-    model = RegressionDLNN(input_dim)
-    
-    # Train the model
-    print(f"Training model with {epochs} epochs and batch size {batch_size}...")
-    history = model.train_model(X, y, epochs=epochs, batch_size=batch_size)
-    
-    # Save the model if path is provided
-    if model_path:
-        model.save_model(model_path)
-    
-    return model
 
 def main():
-    parser = argparse.ArgumentParser(description='Image Forgery Detection using PDyWT and RDLNN')
-    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
-    
-    # Train command
-    train_parser = subparsers.add_parser('train', help='Train the model')
-    train_parser.add_argument('--data', type=str, required=True, help='Path to training data directory')
-    train_parser.add_argument('--model', type=str, default='models/rdlnn_model.pth', help='Path to save trained model')
-    train_parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
-    train_parser.add_argument('--batch-size', type=int, default=32, help='Training batch size')
-    train_parser.add_argument('--early-stopping', type=int, default=5, help='Early stopping patience (epochs)')
-    
-    # Detect command for single image
-    detect_parser = subparsers.add_parser('detect', help='Detect forgery in a single image')
-    detect_parser.add_argument('--image', type=str, required=True, help='Path to image for forgery detection')
-    detect_parser.add_argument('--model', type=str, default='models/rdlnn_model.pth', help='Path to trained model')
-    
-    # Batch process command
-    batch_parser = subparsers.add_parser('batch', help='Process all images in a directory')
-    batch_parser.add_argument('--dir', type=str, required=True, help='Directory containing images to process')
-    batch_parser.add_argument('--model', type=str, default='models/rdlnn_model.pth', help='Path to trained model')
-    batch_parser.add_argument('--workers', type=int, default=4, help='Number of parallel workers')
+    parser = argparse.ArgumentParser(description='Image Forgery Detection System')
+    parser.add_argument('--mode', choices=['train', 'test', 'precompute', 'single'], required=True, 
+                        help='Operating mode: train, test, precompute features, or single image test')
+    parser.add_argument('--input_dir', type=str,
+                        help='Directory containing input images')
+    parser.add_argument('--image_path', type=str,
+                        help='Path to single image for testing')
+    parser.add_argument('--output_dir', type=str, default='results',
+                        help='Directory to save results')
+    parser.add_argument('--model_path', type=str, default='models/forgery_detection_model.pth',
+                        help='Path to save/load model')
+    parser.add_argument('--features_path', type=str, default='features/precomputed_features.npz',
+                        help='Path to save/load precomputed features')
+    parser.add_argument('--batch_size', type=int, default=16,
+                        help='Batch size for processing')
+    parser.add_argument('--workers', type=int, default=4,
+                        help='Number of worker threads for data loading')
+    parser.add_argument('--fp16', action='store_true',
+                        help='Use half precision (FP16) operations')
+    parser.add_argument('--authentic_dir', type=str,
+                        help='Directory containing authentic images (for training)')
+    parser.add_argument('--forged_dir', type=str,
+                        help='Directory containing forged images (for training)')
+    parser.add_argument('--epochs', type=int, default=20,
+                        help='Number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=0.001,
+                        help='Learning rate for training')
     
     args = parser.parse_args()
     
-    # Set up CUDA environment
-    setup_cuda_environment()
+    # Create output directories
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+    os.makedirs(os.path.dirname(args.features_path), exist_ok=True)
     
-    # Check if CUDA is available
-    if not torch.cuda.is_available():
-        print("Warning: CUDA is not available. This implementation requires GPU acceleration.")
+    # Check for CUDA
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    if args.mode == 'precompute':
+        precompute_features(args)
+    elif args.mode == 'train':
+        train_model(args)
+    elif args.mode == 'test':
+        test_model(args)
+    elif args.mode == 'single':
+        test_single_image(args)
+
+def precompute_features(args):
+    """Precompute features for training or testing"""
+    print(f"Precomputing features with batch size {args.batch_size}...")
+    
+    # Initialize the batch processor
+    processor = OptimizedBatchProcessor(
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        use_fp16=args.fp16
+    )
+    
+    # Process authentic images if provided
+    authentic_features = None
+    if args.authentic_dir:
+        print(f"\nProcessing authentic images from {args.authentic_dir}")
+        authentic_features = processor.precompute_features(
+            directory=args.authentic_dir,
+            label=0,  # 0 = authentic
+            save_path=f"{os.path.splitext(args.features_path)[0]}_authentic.npz"
+        )
+    
+    # Process forged images if provided
+    forged_features = None
+    if args.forged_dir:
+        print(f"\nProcessing forged images from {args.forged_dir}")
+        forged_features = processor.precompute_features(
+            directory=args.forged_dir,
+            label=1,  # 1 = forged
+            save_path=f"{os.path.splitext(args.features_path)[0]}_forged.npz"
+        )
+    
+    # Process general input directory if provided
+    if args.input_dir and args.input_dir != args.authentic_dir and args.input_dir != args.forged_dir:
+        print(f"\nProcessing images from {args.input_dir}")
+        processor.precompute_features(
+            directory=args.input_dir,
+            save_path=args.features_path
+        )
+    
+    # Combine authentic and forged features if both were computed
+    if authentic_features and forged_features:
+        print("\nCombining authentic and forged features...")
+        combined_features = {
+            'paths': authentic_features['paths'] + forged_features['paths'],
+            'features': np.vstack([authentic_features['features'], forged_features['features']]),
+            'labels': authentic_features['labels'] + forged_features['labels']
+        }
+        
+        np.savez(
+            args.features_path,
+            paths=combined_features['paths'],
+            features=combined_features['features'],
+            labels=combined_features['labels']
+        )
+        print(f"Saved combined features to {args.features_path}")
+
+def train_model(args):
+    """Train the model using precomputed features"""
+    if not (args.authentic_dir and args.forged_dir) and not os.path.exists(args.features_path):
+        print("Error: For training, either provide authentic_dir and forged_dir arguments, "
+              "or precompute features first and provide features_path.")
         return
     
-    # Handle commands
-    if args.command == 'train':
-        # Create model directory if it doesn't exist
-        os.makedirs(os.path.dirname(args.model), exist_ok=True)
-        train_model(args.data, args.model, args.epochs, args.batch_size)
-        
-    elif args.command == 'detect':
-        # Check if model file exists
-        if not os.path.exists(args.model):
-            print(f"Model file not found: {args.model}")
-            print("Please train the model first or provide a valid model path.")
-            return
-            
-        # Check if image file exists
-        if not os.path.exists(args.image):
-            print(f"Image file not found: {args.image}")
-            return
-            
-        # Load model
-        input_dim = 100  # Placeholder, will be overwritten when loading model
-        model = RegressionDLNN(input_dim)
-        if model.load_model(args.model):
-            # Create a dedicated CUDA stream for this operation
-            stream = torch.cuda.Stream()
-            process_single_image(args.image, model, stream)
-        
-    elif args.command == 'batch':
-        # Check if model file exists
-        if not os.path.exists(args.model):
-            print(f"Model file not found: {args.model}")
-            print("Please train the model first or provide a valid model path.")
-            return
-            
-        # Check if directory exists
-        if not os.path.exists(args.dir):
-            print(f"Directory not found: {args.dir}")
-            return
-            
-        # Load model
-        input_dim = 100  # Placeholder, will be overwritten when loading model
-        model = RegressionDLNN(input_dim)
-        if model.load_model(args.model):
-            batch_process_directory(args.dir, model, num_workers=args.workers)
+    # Load or compute features
+    if not os.path.exists(args.features_path):
+        print("Precomputing features for training...")
+        precompute_features(args)
     
-    else:
-        parser.print_help()
+    print(f"Loading precomputed features from {args.features_path}...")
+    data = np.load(args.features_path)
+    features = data['features']
+    labels = data['labels']
+    
+    # Convert to torch tensors
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X = torch.tensor(features, dtype=torch.float32, device=device)
+    y = torch.tensor(labels, dtype=torch.float32, device=device).unsqueeze(1)
+    
+    # Create and train the model
+    input_dim = features.shape[1]
+    model = RegressionDLNN(input_dim)
+    model.fit(
+        X, y, 
+        epochs=args.epochs, 
+        learning_rate=args.learning_rate,
+        batch_size=args.batch_size,
+        use_fp16=args.fp16
+    )
+    
+    # Save the model
+    model.save(args.model_path)
+    print(f"Model saved to {args.model_path}")
+
+def test_model(args):
+    """Test the model on images in the input directory"""
+    if not os.path.exists(args.model_path):
+        print(f"Error: Model not found at {args.model_path}")
+        return
+    
+    # Load the model
+    model = RegressionDLNN.load(args.model_path)
+    
+    # Initialize the batch processor with the loaded model
+    processor = OptimizedBatchProcessor(
+        model=model,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        use_fp16=args.fp16
+    )
+    
+    print(f"Processing images from {args.input_dir}...")
+    start_time = time.time()
+    
+    # Process all images in the directory
+    results_file = os.path.join(args.output_dir, 'detection_results.txt')
+    results = processor.process_directory(
+        directory=args.input_dir,
+        results_file=results_file
+    )
+    
+    elapsed_time = time.time() - start_time
+    print(f"Processing completed in {elapsed_time:.2f} seconds")
+    print(f"Results saved to {results_file}")
+
+def test_single_image(args):
+    """Test the model on a single image"""
+    if not args.image_path:
+        print("Error: Please provide --image_path argument for single image testing")
+        return
+    
+    if not os.path.exists(args.model_path):
+        print(f"Error: Model not found at {args.model_path}")
+        return
+    
+    if not os.path.exists(args.image_path):
+        print(f"Error: Image not found at {args.image_path}")
+        return
+    
+    # Load the model
+    model = RegressionDLNN.load(args.model_path)
+    
+    # Initialize the batch processor with the loaded model
+    processor = OptimizedBatchProcessor(
+        model=model,
+        batch_size=1,  # Set to 1 for single image
+        num_workers=1,
+        use_fp16=args.fp16
+    )
+    
+    print(f"Processing single image: {args.image_path}")
+    start_time = time.time()
+    
+    # Create a temporary directory with the image
+    temp_dir = os.path.join(args.output_dir, 'temp_single_image')
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Copy the image to the temporary directory
+    import shutil
+    image_name = os.path.basename(args.image_path)
+    temp_image_path = os.path.join(temp_dir, image_name)
+    shutil.copy2(args.image_path, temp_image_path)
+    
+    try:
+        # Process the image
+        features = processor._process_image_batch([args.image_path])
+        
+        if features is not None and len(features) > 0:
+            # Make prediction
+            predictions, confidences = processor.batch_predict(features)
+            
+            if predictions is not None and len(predictions) > 0:
+                # Display results
+                prediction = predictions[0]
+                confidence = confidences[0]
+                result = "FORGED" if prediction == 1 else "AUTHENTIC"
+                
+                print(f"\nResult: {result}")
+                print(f"Confidence: {confidence:.4f}")
+                print(f"Prediction value: {prediction}")
+                
+                # Save the result
+                result_file = os.path.join(args.output_dir, f"{os.path.splitext(image_name)[0]}_result.txt")
+                with open(result_file, 'w') as f:
+                    f.write(f"Image: {args.image_path}\n")
+                    f.write(f"Result: {result}\n")
+                    f.write(f"Confidence: {confidence:.4f}\n")
+                    f.write(f"Prediction value: {prediction}\n")
+                
+                print(f"Result saved to {result_file}")
+            else:
+                print("Failed to make prediction")
+        else:
+            print("Failed to extract features")
+    
+    except Exception as e:
+        print(f"Error processing image: {e}")
+    
+    finally:
+        # Clean up temporary directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    elapsed_time = time.time() - start_time
+    print(f"Processing completed in {elapsed_time:.2f} seconds")
 
 if __name__ == "__main__":
     main()
