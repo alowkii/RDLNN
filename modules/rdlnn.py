@@ -1,3 +1,7 @@
+"""
+Regression Deep Learning Neural Network (RDLNN) for image forgery detection
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,9 +11,13 @@ from sklearn.model_selection import train_test_split
 import numpy as np
 import os
 import gc
-from torch.amp import autocast, GradScaler
 import time
 import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple, Any, Optional, Union
+from tqdm import tqdm
+
+from modules.utils import logger, plot_diagnostic_curves, clean_cuda_memory
+from modules.data_handling import create_training_validation_split, create_dataloaders, get_class_weights
 
 class RegressionDLNN:
     """
@@ -17,7 +25,7 @@ class RegressionDLNN:
     Implemented with PyTorch and CUDA support with improved handling of imbalanced data
     """
     
-    def __init__(self, input_dim):
+    def __init__(self, input_dim: int):
         """
         Initialize the RDLNN model
         
@@ -48,7 +56,7 @@ class RegressionDLNN:
             nn.LeakyReLU(0.1),
             nn.Dropout(0.5),
             
-            # Output layer - remove sigmoid activation
+            # Output layer - sigmoid is handled in loss function
             nn.Linear(64, 1)
         ).to(self.device)
         
@@ -62,13 +70,13 @@ class RegressionDLNN:
         self.scaler = StandardScaler()
         
         # Initialize gradient scaler for mixed precision training
-        self.scaler_amp = GradScaler()
+        self.scaler_amp = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
         
         # Print device information
         if torch.cuda.is_available():
-            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
         else:
-            print("Using CPU for computation")
+            logger.info("Using CPU for computation")
         
     def _init_weights(self):
         """Initialize weights using Xavier initialization"""
@@ -78,8 +86,15 @@ class RegressionDLNN:
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
-    def fit(self, X, y, epochs=50, learning_rate=0.001, batch_size=32, validation_split=0.2, 
-            early_stopping=10, use_fp16=False, force_class_balance=False):
+    def fit(self, X: Union[np.ndarray, torch.Tensor], 
+            y: Union[np.ndarray, torch.Tensor], 
+            epochs: int = 50, 
+            learning_rate: float = 0.001, 
+            batch_size: int = 32, 
+            validation_split: float = 0.2, 
+            early_stopping: int = 10, 
+            use_fp16: bool = False, 
+            force_class_balance: bool = False) -> Dict[str, List[float]]:
         """
         Train the RDLNN model with optimized training loop and balanced sampling
         
@@ -105,7 +120,7 @@ class RegressionDLNN:
             betas=(0.9, 0.999)  # Default Adam parameters
         )
         
-        print(f"Training with learning rate: {learning_rate:.6f}")
+        logger.info(f"Training with learning rate: {learning_rate:.6f}")
         
         # Learning rate scheduler with warm restarts
         self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -141,85 +156,44 @@ class RegressionDLNN:
             class_weights[i] = total_samples / (len(unique_classes) * count)
         
         # Print class weights
-        print(f"Class weights: {class_weights}")
+        logger.info(f"Class weights: {class_weights}")
         
         # Use MUCH higher weight for minority class (forged)
         # This is crucial to fix the "all one class" prediction problem
         if force_class_balance:
             pos_weight_value = 5.0  # Force very high weight for positive class
-            print(f"Forcing positive class weight to {pos_weight_value}")
+            logger.info(f"Forcing positive class weight to {pos_weight_value}")
         else:
             pos_weight_value = class_weights[1]/class_weights[0]
             
         # Update loss function to use weights
         weight_tensor = torch.tensor([pos_weight_value], device=self.device)
-        print(f"Using positive weight: {pos_weight_value:.4f}")
+        logger.info(f"Using positive weight: {pos_weight_value:.4f}")
         self.loss_fn = nn.BCEWithLogitsLoss(
             pos_weight=weight_tensor
         )
             
         # Split data into training and validation sets using sklearn to ensure balance
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_np, y_np, test_size=validation_split, random_state=42, stratify=y_np
+        X_train, X_val, y_train, y_val = create_training_validation_split(
+            X_np, y_np, validation_split=validation_split
         )
         
         # Verify balance after split
-        print(f"Training class distribution: {np.bincount(y_train.flatten().astype(int))}")
-        print(f"Validation class distribution: {np.bincount(y_val.flatten().astype(int))}")
+        logger.info(f"Training class distribution: {np.bincount(y_train.flatten().astype(int))}")
+        logger.info(f"Validation class distribution: {np.bincount(y_val.flatten().astype(int))}")
         
         # Normalize features - fit only on training data
         self.scaler = StandardScaler().fit(X_train)
         X_train_scaled = self.scaler.transform(X_train)
         X_val_scaled = self.scaler.transform(X_val)
         
-        # Convert to torch tensors
-        X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32, device=self.device)
-        y_train_tensor = torch.tensor(y_train, dtype=torch.float32, device=self.device)
-        X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32, device=self.device)
-        y_val_tensor = torch.tensor(y_val, dtype=torch.float32, device=self.device)
-        
-        # Create datasets
-        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-        val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-        
-        # Calculate optimal number of workers
-        num_workers = min(4, os.cpu_count() or 4)
-        
-        # Handle class imbalance using weighted sampling
-        if np.bincount(y_train.flatten().astype(int))[0] != np.bincount(y_train.flatten().astype(int))[1]:
-            print("Using weighted sampler for balanced batches")
-            weights = 1.0 / np.bincount(y_train.flatten().astype(int))
-            sample_weights = torch.tensor([weights[int(t)] for t in y_train.flatten()], dtype=torch.float32)
-            sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
-            
-            train_loader = DataLoader(
-                train_dataset, 
-                batch_size=batch_size,
-                sampler=sampler,
-                num_workers=num_workers
-            )
-        else:
-            train_loader = DataLoader(
-                train_dataset, 
-                batch_size=batch_size, 
-                shuffle=True,
-                num_workers=num_workers
-            )
-
-        val_loader = DataLoader(
-            val_dataset, 
+        # Create data loaders
+        train_loader, val_loader = create_dataloaders(
+            X_train_scaled, X_val_scaled, y_train, y_val,
             batch_size=batch_size,
-            num_workers=num_workers
+            num_workers=min(4, os.cpu_count() or 4),
+            use_balanced_sampling=True if not force_class_balance else False
         )
-        
-        # Print dataset information
-        print(f"Training samples: {len(train_dataset)}")
-        print(f"Validation samples: {len(val_dataset)}")
-        print(f"Class distribution in training: {np.bincount(y_train.flatten().astype(int))}")
-        print(f"Class distribution in validation: {np.bincount(y_val.flatten().astype(int))}")
-        
-        # Set model to training mode
-        self.model.train()
         
         # Training history
         history = {
@@ -235,6 +209,7 @@ class RegressionDLNN:
         best_model_state = None
         early_stopping_counter = 0
         
+        # Training loop
         for epoch in range(epochs):
             start_time = time.time()
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -245,8 +220,16 @@ class RegressionDLNN:
             train_correct = 0
             train_samples = 0
             
-            # Training loop with mixed precision if requested
-            for inputs, targets in train_loader:
+            # Set model to training mode
+            self.model.train()
+            
+            # Training loop with tqdm progress bar
+            train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
+            for inputs, targets in train_pbar:
+                # Move inputs and targets to device
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                
                 # Zero the gradients
                 self.optimizer.zero_grad()
                 
@@ -260,7 +243,7 @@ class RegressionDLNN:
                 # Forward and backward pass
                 if use_fp16 and self.device.type == 'cuda':
                     # Using mixed precision
-                    with autocast(device_type='cuda', dtype=torch.float16):
+                    with torch.cuda.amp.autocast():
                         outputs = self.model(inputs)
                         loss = self.loss_fn(outputs, targets)
                     
@@ -289,6 +272,12 @@ class RegressionDLNN:
                 predicted = (torch.sigmoid(outputs) >= 0.5).float()
                 train_correct += (predicted == targets.round()).sum().item()
                 train_samples += inputs.size(0)
+                
+                # Update progress bar
+                train_pbar.set_postfix({
+                    'loss': loss.item(),
+                    'acc': train_correct / train_samples
+                })
             
             # Calculate epoch metrics
             avg_train_loss = train_loss / train_samples
@@ -304,10 +293,16 @@ class RegressionDLNN:
             val_targets_list = []
             val_outputs_list = []
             
+            # Validation loop with tqdm progress bar
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]")
             with torch.no_grad():
-                for inputs, targets in val_loader:
+                for inputs, targets in val_pbar:
+                    # Move inputs and targets to device
+                    inputs = inputs.to(self.device)
+                    targets = targets.to(self.device)
+                    
                     if use_fp16 and self.device.type == 'cuda':
-                        with autocast(device_type='cuda', dtype=torch.float16):
+                        with torch.cuda.amp.autocast():
                             outputs = self.model(inputs)
                             loss = self.loss_fn(outputs, targets)
                     else:
@@ -327,6 +322,12 @@ class RegressionDLNN:
                     val_preds.extend(predicted.cpu().numpy())
                     val_targets_list.extend(targets.cpu().numpy())
                     val_outputs_list.extend(probabilities.cpu().numpy())
+                    
+                    # Update progress bar
+                    val_pbar.set_postfix({
+                        'loss': loss.item(),
+                        'acc': val_correct / val_samples
+                    })
             
             # Calculate validation metrics
             avg_val_loss = val_loss / val_samples
@@ -356,15 +357,15 @@ class RegressionDLNN:
                 early_stopping_counter = 0
                 # Save best model state
                 best_model_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
-                print(f"✓ New best validation loss: {best_val_loss:.6f}")
+                logger.info(f"✓ New best validation loss: {best_val_loss:.6f}")
             else:
                 early_stopping_counter += 1
-                print(f"! Validation loss did not improve. Early stopping counter: {early_stopping_counter}/{early_stopping}")
+                logger.info(f"! Validation loss did not improve. Early stopping counter: {early_stopping_counter}/{early_stopping}")
                 
                 if early_stopping_counter >= early_stopping:
-                    print("\n" + "="*80)
-                    print(f"EARLY STOPPING TRIGGERED (after {epoch+1} epochs)")
-                    print("="*80)
+                    logger.info("\n" + "="*80)
+                    logger.info(f"EARLY STOPPING TRIGGERED (after {epoch+1} epochs)")
+                    logger.info("="*80)
                     
                     # Check if model is just predicting one class
                     unique_preds, counts = np.unique(val_preds, return_counts=True)
@@ -372,22 +373,19 @@ class RegressionDLNN:
                     
                     if len(pred_dist) == 1:
                         only_class = list(pred_dist.keys())[0]
-                        print(f"WARNING: Model is predicting ONLY class {only_class} for ALL samples!")
-                        print("This suggests the model hasn't learned to differentiate between classes.")
-                        print("Suggestions:")
-                        print("1. Increase learning rate (try 0.001 or 0.005)")
-                        print("2. Train for more epochs")
-                        print("3. Check feature quality/usefulness")
-                        print("4. Consider using a different model architecture")
+                        logger.warning(f"WARNING: Model is predicting ONLY class {only_class} for ALL samples!")
+                        logger.warning("This suggests the model hasn't learned to differentiate between classes.")
+                        logger.info("Suggestions:")
+                        logger.info("1. Increase learning rate (try 0.001 or 0.005)")
+                        logger.info("2. Train for more epochs")
+                        logger.info("3. Check feature quality/usefulness")
+                        logger.info("4. Consider using a different model architecture")
                     else:
-                        print(f"Final prediction distribution: {pred_dist}")
+                        logger.info(f"Final prediction distribution: {pred_dist}")
                     
                     # Restore best model state
                     self.model.load_state_dict(best_model_state)
                     break
-            
-            # Back to training mode
-            self.model.train()
             
             # Store history
             history['train_loss'].append(avg_train_loss)
@@ -399,18 +397,18 @@ class RegressionDLNN:
             epoch_time = time.time() - start_time
             
             # Print progress with detailed metrics in a cleaner format
-            print("\n" + "="*80)
-            print(f"EPOCH {epoch+1}/{epochs} (Time: {epoch_time:.2f}s, LR: {current_lr:.6f})")
-            print("-"*80)
-            print(f"Training   | Loss: {avg_train_loss:.4f} | Accuracy: {train_accuracy:.2%}")
-            print(f"Validation | Loss: {avg_val_loss:.4f} | Accuracy: {val_accuracy:.2%}")
-            print("-"*80)
-            print(f"Confusion Matrix:")
-            print(f"                | Predicted Positive | Predicted Negative |")
-            print(f"Actual Positive | {tp:^18} | {fn:^18} |")
-            print(f"Actual Negative | {fp:^18} | {tn:^18} |")
-            print("-"*80)
-            print(f"Metrics | Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f}")
+            logger.info("\n" + "="*80)
+            logger.info(f"EPOCH {epoch+1}/{epochs} (Time: {epoch_time:.2f}s, LR: {current_lr:.6f})")
+            logger.info("-"*80)
+            logger.info(f"Training   | Loss: {avg_train_loss:.4f} | Accuracy: {train_accuracy:.2%}")
+            logger.info(f"Validation | Loss: {avg_val_loss:.4f} | Accuracy: {val_accuracy:.2%}")
+            logger.info("-"*80)
+            logger.info(f"Confusion Matrix:")
+            logger.info(f"                | Predicted Positive | Predicted Negative |")
+            logger.info(f"Actual Positive | {tp:^18} | {fn:^18} |")
+            logger.info(f"Actual Negative | {fp:^18} | {tn:^18} |")
+            logger.info("-"*80)
+            logger.info(f"Metrics | Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f}")
             
             # Show prediction distribution
             unique_preds, counts = np.unique(val_preds, return_counts=True)
@@ -419,9 +417,9 @@ class RegressionDLNN:
             # Format nicely
             if len(pred_dist) == 1:
                 only_class = list(pred_dist.keys())[0]
-                print(f"WARNING: Model is predicting ONLY class {only_class} for ALL validation samples!")
+                logger.warning(f"WARNING: Model is predicting ONLY class {only_class} for ALL validation samples!")
             else:
-                print(f"Prediction distribution: {pred_dist}")
+                logger.info(f"Prediction distribution: {pred_dist}")
             
             # Calculate and print probability distribution
             val_outputs_array = np.array(val_outputs_list).flatten()
@@ -433,10 +431,10 @@ class RegressionDLNN:
                 p75 = np.percentile(val_outputs_array, 75)
                 p90 = np.percentile(val_outputs_array, 90)
                 
-                print("-"*80)
-                print("Probability Distribution:")
-                print(f"Range: [{val_outputs_array.min():.4f} - {val_outputs_array.max():.4f}] | Mean: {val_outputs_array.mean():.4f} | Std: {val_outputs_array.std():.4f}")
-                print(f"Percentiles: 10%: {p10:.4f} | 25%: {p25:.4f} | 50%: {p50:.4f} | 75%: {p75:.4f} | 90%: {p90:.4f}")
+                logger.info("-"*80)
+                logger.info("Probability Distribution:")
+                logger.info(f"Range: [{val_outputs_array.min():.4f} - {val_outputs_array.max():.4f}] | Mean: {val_outputs_array.mean():.4f} | Std: {val_outputs_array.std():.4f}")
+                logger.info(f"Percentiles: 10%: {p10:.4f} | 25%: {p25:.4f} | 50%: {p50:.4f} | 75%: {p75:.4f} | 90%: {p90:.4f}")
                 
                 # Analyze confidence levels
                 high_conf = np.sum((val_outputs_array > 0.9) | (val_outputs_array < 0.1))
@@ -444,87 +442,29 @@ class RegressionDLNN:
                                     (val_outputs_array > 0.1) & (val_outputs_array < 0.3))
                 uncertain = np.sum((val_outputs_array >= 0.3) & (val_outputs_array <= 0.7))
                 
-                print(f"Confidence levels:")
-                print(f"  High (>0.9 or <0.1): {high_conf} samples ({high_conf/len(val_outputs_array)*100:.1f}%)")
-                print(f"  Medium: {medium_conf} samples ({medium_conf/len(val_outputs_array)*100:.1f}%)")
-                print(f"  Uncertain (0.3-0.7): {uncertain} samples ({uncertain/len(val_outputs_array)*100:.1f}%)")
-                print("="*80)
+                logger.info(f"Confidence levels:")
+                logger.info(f"  High (>0.9 or <0.1): {high_conf} samples ({high_conf/len(val_outputs_array)*100:.1f}%)")
+                logger.info(f"  Medium: {medium_conf} samples ({medium_conf/len(val_outputs_array)*100:.1f}%)")
+                logger.info(f"  Uncertain (0.3-0.7): {uncertain} samples ({uncertain/len(val_outputs_array)*100:.1f}%)")
+                logger.info("="*80)
             
             # Periodically clear CUDA cache
             if self.device.type == 'cuda' and epoch % 5 == 0:
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                gc.collect()
+                clean_cuda_memory()
         
         # Final cleanup
         if best_model_state:
-            if self.device.type == 'cuda':
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-            gc.collect()
+            clean_cuda_memory()
         
         # Generate model diagnostics
-        self.plot_diagnostic_curves(val_targets_list, val_outputs_list, history)
+        try:
+            plot_diagnostic_curves(val_targets_list, val_outputs_array, history, 'results')
+        except Exception as e:
+            logger.error(f"Error generating diagnostic curves: {e}")
         
         return history
     
-    def plot_diagnostic_curves(self, y_true, y_pred_prob, history):
-        """Generate ROC and Precision-Recall curves for model diagnostics"""
-        try:
-            import sklearn.metrics as metrics
-            
-            # Only proceed if we have predictions from both classes
-            unique_classes = np.unique(y_true)
-            if len(unique_classes) < 2:
-                print("Cannot generate diagnostic curves: not enough classes in validation set")
-                return
-            
-            # Calculate ROC curve
-            fpr, tpr, thresholds = metrics.roc_curve(y_true, y_pred_prob)
-            roc_auc = metrics.auc(fpr, tpr)
-            
-            # Calculate Precision-Recall curve
-            precision, recall, _ = metrics.precision_recall_curve(y_true, y_pred_prob)
-            pr_auc = metrics.average_precision_score(y_true, y_pred_prob)
-            
-            # Create diagnostic plots
-            plt.figure(figsize=(15, 5))
-            
-            # ROC curve
-            plt.subplot(1, 3, 1)
-            plt.plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.3f})')
-            plt.plot([0, 1], [0, 1], 'k--')
-            plt.xlabel('False Positive Rate')
-            plt.ylabel('True Positive Rate')
-            plt.title('Receiver Operating Characteristic')
-            plt.legend(loc='lower right')
-            
-            # Precision-Recall curve
-            plt.subplot(1, 3, 2)
-            plt.plot(recall, precision, label=f'PR curve (AUC = {pr_auc:.3f})')
-            plt.xlabel('Recall')
-            plt.ylabel('Precision')
-            plt.title('Precision-Recall Curve')
-            plt.legend(loc='lower left')
-            
-            # Learning rate curve
-            plt.subplot(1, 3, 3)
-            plt.semilogy(history['learning_rates'], label='Learning Rate')
-            plt.xlabel('Epoch')
-            plt.ylabel('Learning Rate (log scale)')
-            plt.title('Learning Rate Decay')
-            plt.legend()
-            
-            plt.tight_layout()
-            plt.savefig('results/model_diagnostics.png')
-            print(f"Model diagnostic curves saved to results/model_diagnostics.png")
-            
-        except ImportError:
-            print("Scikit-learn is required for diagnostic curves")
-        except Exception as e:
-            print(f"Error generating diagnostic curves: {e}")
-    
-    def predict(self, X):
+    def predict(self, X: Union[np.ndarray, torch.Tensor]) -> Tuple[np.ndarray, np.ndarray]:
         """
         Predict if an image is forged (1) or authentic (0)
         
@@ -546,7 +486,7 @@ class RegressionDLNN:
             X_scaled = self.scaler.transform(X)
         else:
             X_scaled = X
-            print("Warning: StandardScaler not fitted yet. Using raw features.")
+            logger.warning("Warning: StandardScaler not fitted yet. Using raw features.")
         
         # Convert to tensor and move to device
         X_tensor = torch.tensor(X_scaled, dtype=torch.float32, device=self.device)
@@ -564,7 +504,7 @@ class RegressionDLNN:
         # Return predictions and confidences
         return predictions.flatten(), confidences.flatten()
     
-    def save(self, filepath):
+    def save(self, filepath: str) -> None:
         """Save the model to disk"""
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         
@@ -577,10 +517,10 @@ class RegressionDLNN:
             'input_dim': self.model[0].in_features,
         }, filepath)
         
-        print(f"Model saved to {filepath}")
+        logger.info(f"Model saved to {filepath}")
 
     @classmethod
-    def load(cls, filepath):
+    def load(cls, filepath: str) -> 'RegressionDLNN':
         """Load a trained model from disk
         
         Args:
@@ -608,5 +548,5 @@ class RegressionDLNN:
         # Move model to the correct device after loading
         model.model = model.model.to(model.device)
         
-        print(f"Model loaded successfully from {filepath}")
+        logger.info(f"Model loaded successfully from {filepath}")
         return model
