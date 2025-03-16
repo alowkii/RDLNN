@@ -1,12 +1,11 @@
 import numpy as np
 import pywt
 import torch
-import cupy as cp
-from cupyx.scipy.ndimage import gaussian_filter
+import torch.nn.functional as F
 
 def polar_dyadic_wavelet_transform(ycbcr_img):
     """
-    Implement GPU-accelerated Polar Dyadic Wavelet Transform (PDyWT)
+    Implement GPU-accelerated Polar Dyadic Wavelet Transform (PDyWT) using PyTorch
     
     Args:
         ycbcr_img: YCbCr preprocessed image as torch.Tensor [C, H, W]
@@ -16,33 +15,27 @@ def polar_dyadic_wavelet_transform(ycbcr_img):
     """
     try:
         # Check if GPU is available
-        if not torch.cuda.is_available() or not cp.cuda.is_available():
-            raise RuntimeError("CUDA GPU not available for CuPy or PyTorch")
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Convert input to numpy if it's a torch tensor
-        if isinstance(ycbcr_img, torch.Tensor):
-            # Move tensor to CPU and convert to numpy
-            if ycbcr_img.is_cuda:
-                ycbcr_img = ycbcr_img.cpu()
-            ycbcr_np = ycbcr_img.numpy()
-        else:
-            ycbcr_np = ycbcr_img
+        # Convert input to torch tensor if it's not already
+        if not isinstance(ycbcr_img, torch.Tensor):
+            ycbcr_img = torch.tensor(ycbcr_img, dtype=torch.float32)
+        
+        # Ensure tensor is on the right device
+        ycbcr_img = ycbcr_img.to(device)
             
         # Handle different tensor formats
-        if ycbcr_np.ndim == 3 and ycbcr_np.shape[0] == 3:  # [C, H, W] format
+        if ycbcr_img.ndim == 3 and ycbcr_img.shape[0] == 3:  # [C, H, W] format
             # Rearrange to [H, W, C] for processing
-            ycbcr_np = np.transpose(ycbcr_np, (1, 2, 0))
-        
-        # Transfer image to GPU using CuPy
-        ycbcr_gpu = cp.asarray(ycbcr_np, dtype=cp.float32)
+            ycbcr_img = ycbcr_img.permute(1, 2, 0)
         
         # Split YCbCr channels 
-        if ycbcr_gpu.ndim == 3 and ycbcr_gpu.shape[2] == 3:
-            y_channel = ycbcr_gpu[:, :, 0]
-            cb_channel = ycbcr_gpu[:, :, 1]
-            cr_channel = ycbcr_gpu[:, :, 2]
+        if ycbcr_img.ndim == 3 and ycbcr_img.shape[2] == 3:
+            y_channel = ycbcr_img[:, :, 0]
+            cb_channel = ycbcr_img[:, :, 1]
+            cr_channel = ycbcr_img[:, :, 2]
         else:
-            raise ValueError(f"Expected 3-channel image, got shape {ycbcr_gpu.shape}")
+            raise ValueError(f"Expected 3-channel image, got shape {ycbcr_img.shape}")
         
         # Make dimensions even for wavelet transform
         h, w = y_channel.shape
@@ -50,17 +43,14 @@ def polar_dyadic_wavelet_transform(ycbcr_img):
         
         # Apply padding if needed
         if h_pad != 0 or w_pad != 0:
-            y_channel = cp.pad(y_channel, ((0, h_pad), (0, w_pad)), mode='reflect')
-            cb_channel = cp.pad(cb_channel, ((0, h_pad), (0, w_pad)), mode='reflect') 
-            cr_channel = cp.pad(cr_channel, ((0, h_pad), (0, w_pad)), mode='reflect')
+            y_channel = F.pad(y_channel.unsqueeze(0).unsqueeze(0), (0, w_pad, 0, h_pad), mode='reflect').squeeze(0).squeeze(0)
+            cb_channel = F.pad(cb_channel.unsqueeze(0).unsqueeze(0), (0, w_pad, 0, h_pad), mode='reflect').squeeze(0).squeeze(0)
+            cr_channel = F.pad(cr_channel.unsqueeze(0).unsqueeze(0), (0, w_pad, 0, h_pad), mode='reflect').squeeze(0).squeeze(0)
         
-        # Get updated dimensions
-        h, w = y_channel.shape
-        
-        # Apply GPU-based wavelet transform
-        coeffs_y = _gpu_swt2(y_channel)
-        coeffs_cb = _gpu_swt2(cb_channel)
-        coeffs_cr = _gpu_swt2(cr_channel)
+        # Apply PyTorch-based wavelet transform
+        coeffs_y = _torch_swt2(y_channel, device)
+        coeffs_cb = _torch_swt2(cb_channel, device)
+        coeffs_cr = _torch_swt2(cr_channel, device)
         
         # Apply polar transformation
         polar_coeffs_y = _transform_to_polar(coeffs_y)
@@ -78,51 +68,51 @@ def polar_dyadic_wavelet_transform(ycbcr_img):
         print(f"Error in polar dyadic wavelet transform: {e}")
         raise e
 
-def _gpu_swt2(data_gpu):
+def _torch_swt2(data, device):
     """
-    GPU implementation of stationary wavelet transform
+    PyTorch implementation of stationary wavelet transform
     
     Args:
-        data_gpu: 2D CuPy array
+        data: 2D PyTorch tensor
+        device: PyTorch device
         
     Returns:
         Tuple of (LL, LH, HL, HH) wavelet coefficients
     """
     # Haar wavelet filters
-    low_filter = cp.asarray([0.5, 0.5], dtype=cp.float32)
-    high_filter = cp.asarray([0.5, -0.5], dtype=cp.float32)
+    low_filter = torch.tensor([0.5, 0.5], dtype=torch.float32, device=device)
+    high_filter = torch.tensor([0.5, -0.5], dtype=torch.float32, device=device)
     
     # Create 2D separable filters
-    h, w = data_gpu.shape
-    filter_size = 2
+    low_filter_x = low_filter.view(1, 1, 1, -1)
+    low_filter_y = low_filter.view(1, 1, -1, 1)
+    high_filter_x = high_filter.view(1, 1, 1, -1)
+    high_filter_y = high_filter.view(1, 1, -1, 1)
     
-    # Function to apply separable convolution
-    def apply_separable_filter(data, filter_x, filter_y):
-        # Apply horizontal filter
-        temp = cp.zeros_like(data)
-        for i in range(filter_size):
-            if i < len(filter_x):
-                temp += cp.roll(data, i - filter_size//2, axis=1) * filter_x[i]
-        
-        # Apply vertical filter to temp result
-        result = cp.zeros_like(temp)
-        for i in range(filter_size):
-            if i < len(filter_y):
-                result += cp.roll(temp, i - filter_size//2, axis=0) * filter_y[i]
-        
-        return result
+    # Apply 2D separable convolution
+    data_4d = data.unsqueeze(0).unsqueeze(0)
     
-    # Apply filters to get wavelet coefficients
-    ll = apply_separable_filter(data_gpu, low_filter, low_filter)
-    lh = apply_separable_filter(data_gpu, low_filter, high_filter)
-    hl = apply_separable_filter(data_gpu, high_filter, low_filter)
-    hh = apply_separable_filter(data_gpu, high_filter, high_filter)
+    # Low-Low
+    ll_h = F.conv2d(data_4d, low_filter_x, padding='same')
+    ll = F.conv2d(ll_h, low_filter_y, padding='same').squeeze(0).squeeze(0)
+    
+    # Low-High
+    lh_h = F.conv2d(data_4d, low_filter_x, padding='same')
+    lh = F.conv2d(lh_h, high_filter_y, padding='same').squeeze(0).squeeze(0)
+    
+    # High-Low
+    hl_h = F.conv2d(data_4d, high_filter_x, padding='same')
+    hl = F.conv2d(hl_h, low_filter_y, padding='same').squeeze(0).squeeze(0)
+    
+    # High-High
+    hh_h = F.conv2d(data_4d, high_filter_x, padding='same')
+    hh = F.conv2d(hh_h, high_filter_y, padding='same').squeeze(0).squeeze(0)
     
     return ll, lh, hl, hh
 
 def _transform_to_polar(coeffs):
     """
-    Transform wavelet coefficients to polar coordinates
+    Transform wavelet coefficients to polar coordinates using PyTorch
     
     Args:
         coeffs: Tuple of (LL, LH, HL, HH) wavelet coefficients
@@ -132,19 +122,21 @@ def _transform_to_polar(coeffs):
     """
     ll, lh, hl, hh = coeffs
     h, w = ll.shape
+    device = ll.device
     
     # Create coordinate grid
-    y_coords, x_coords = cp.mgrid[0:h, 0:w]
+    y_coords = torch.arange(0, h, device=device).view(-1, 1).repeat(1, w)
+    x_coords = torch.arange(0, w, device=device).view(1, -1).repeat(h, 1)
     
     # Find center point
     center_y, center_x = h // 2, w // 2
     
     # Calculate polar coordinates (radius and angle)
-    r = cp.sqrt((y_coords - center_y)**2 + (x_coords - center_x)**2)
-    theta = cp.arctan2(y_coords - center_y, x_coords - center_x)
+    r = torch.sqrt((y_coords - center_y)**2 + (x_coords - center_x)**2)
+    theta = torch.atan2(y_coords - center_y, x_coords - center_x)
     
     # Normalize radius
-    max_radius = cp.sqrt((h/2)**2 + (w/2)**2)
+    max_radius = torch.sqrt(torch.tensor((h/2)**2 + (w/2)**2, device=device))
     r_norm = r / max_radius
     
     # Apply polar weighting to coefficients (radial emphasis)

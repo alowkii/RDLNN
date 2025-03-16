@@ -168,6 +168,9 @@ def train_model(train_dir, model_path=None, epochs=50, batch_size=32):
                 forged_labels.append(1)  # 1 = forged
         except Exception as e:
             print(f"\nError processing {img_name}: {e}")
+            return None, 0
+        finally:
+            torch.cuda.empty_cache()
             
         # Periodically clear cache to prevent OOM errors
         if len(forged_features) % 50 == 0:
