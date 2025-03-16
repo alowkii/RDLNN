@@ -39,9 +39,10 @@ def polar_dyadic_wavelet_transform(ycbcr_img):
         
         # Make dimensions even for wavelet transform
         h, w = y_channel.shape
-        h_pad, w_pad = (h % 2), (w % 2)
+        h_pad = 0 if h % 2 == 0 else 1
+        w_pad = 0 if w % 2 == 0 else 1
         
-        # Apply padding if needed
+        # Apply padding if needed - ensure we get even dimensions
         if h_pad != 0 or w_pad != 0:
             y_channel = F.pad(y_channel.unsqueeze(0).unsqueeze(0), (0, w_pad, 0, h_pad), mode='reflect').squeeze(0).squeeze(0)
             cb_channel = F.pad(cb_channel.unsqueeze(0).unsqueeze(0), (0, w_pad, 0, h_pad), mode='reflect').squeeze(0).squeeze(0)
@@ -92,21 +93,28 @@ def _torch_swt2(data, device):
     # Apply 2D separable convolution
     data_4d = data.unsqueeze(0).unsqueeze(0)
     
+    # Calculate appropriate padding manually instead of using 'same'
+    pad_x = low_filter_x.shape[-1] // 2
+    pad_y = low_filter_y.shape[2] // 2
+    
+    # Apply manual padding for all operations
+    data_padded = F.pad(data_4d, (pad_x, pad_x, pad_y, pad_y), mode='reflect')
+    
     # Low-Low
-    ll_h = F.conv2d(data_4d, low_filter_x, padding='same')
-    ll = F.conv2d(ll_h, low_filter_y, padding='same').squeeze(0).squeeze(0)
+    ll_h = F.conv2d(data_padded, low_filter_x, padding=0)
+    ll = F.conv2d(ll_h, low_filter_y, padding=0).squeeze(0).squeeze(0)
     
     # Low-High
-    lh_h = F.conv2d(data_4d, low_filter_x, padding='same')
-    lh = F.conv2d(lh_h, high_filter_y, padding='same').squeeze(0).squeeze(0)
+    lh_h = F.conv2d(data_padded, low_filter_x, padding=0)
+    lh = F.conv2d(lh_h, high_filter_y, padding=0).squeeze(0).squeeze(0)
     
     # High-Low
-    hl_h = F.conv2d(data_4d, high_filter_x, padding='same')
-    hl = F.conv2d(hl_h, low_filter_y, padding='same').squeeze(0).squeeze(0)
+    hl_h = F.conv2d(data_padded, high_filter_x, padding=0)
+    hl = F.conv2d(hl_h, low_filter_y, padding=0).squeeze(0).squeeze(0)
     
     # High-High
-    hh_h = F.conv2d(data_4d, high_filter_x, padding='same')
-    hh = F.conv2d(hh_h, high_filter_y, padding='same').squeeze(0).squeeze(0)
+    hh_h = F.conv2d(data_padded, high_filter_x, padding=0)
+    hh = F.conv2d(hh_h, high_filter_y, padding=0).squeeze(0).squeeze(0)
     
     return ll, lh, hl, hh
 
@@ -121,8 +129,15 @@ def _transform_to_polar(coeffs):
         Tuple of transformed coefficients
     """
     ll, lh, hl, hh = coeffs
+    
+    # Ensure all coefficients have the same shape
     h, w = ll.shape
     device = ll.device
+    
+    # Check and possibly resize other coefficients if needed
+    lh = F.interpolate(lh.unsqueeze(0).unsqueeze(0), size=(h, w), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+    hl = F.interpolate(hl.unsqueeze(0).unsqueeze(0), size=(h, w), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+    hh = F.interpolate(hh.unsqueeze(0).unsqueeze(0), size=(h, w), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
     
     # Create coordinate grid
     y_coords = torch.arange(0, h, device=device).view(-1, 1).repeat(1, w)
