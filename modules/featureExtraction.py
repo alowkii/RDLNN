@@ -1,13 +1,18 @@
+"""
+Feature extraction functions for image forgery detection
+"""
+
 import torch
 import torch.nn.functional as F
+import torch.cuda.amp as amp
 import numpy as np
-import gc
-from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Tuple, Any, Optional
+from modules.utils import logger
 
 class BatchFeatureExtractor:
     """
-    Optimized batch feature extractor for image forgery detection
-    Processes multiple images at once using efficient GPU operations
+    Feature extractor for image forgery detection that processes multiple images at once.
+    Extracts edge, color, and wavelet-based features from images.
     """
     
     def __init__(self, device=None, batch_size=16, num_workers=4, use_fp16=True):
@@ -29,7 +34,10 @@ class BatchFeatureExtractor:
         self._initialize_filters()
         
         # Create CUDA streams for overlapping operations
-        self.streams = [torch.cuda.Stream(device=self.device) for _ in range(3)]
+        if self.device.type == 'cuda':
+            self.streams = [torch.cuda.Stream(device=self.device) for _ in range(3)]
+        else:
+            self.streams = [None] * 3
         
     def _initialize_filters(self):
         """Pre-compute filters and tensors used in feature extraction"""
@@ -48,7 +56,7 @@ class BatchFeatureExtractor:
             [0.5, -0.4187, -0.0813]     # Cr
         ], dtype=torch.float16 if self.use_fp16 else torch.float32, device=self.device)
         
-    def extract_batch_features(self, image_batch, wavelet_coeffs_batch):
+    def extract_batch_features(self, image_batch: torch.Tensor, wavelet_coeffs_batch: List[Dict[str, Tuple]]) -> torch.Tensor:
         """
         Extract features from a batch of images
         
@@ -64,33 +72,45 @@ class BatchFeatureExtractor:
         # List to store feature vectors for each image
         batch_features = []
         
-        # Process in streams to overlap computation
-        with torch.cuda.stream(self.streams[0]):
+        # Process with CUDA streams if available to overlap computation
+        if self.device.type == 'cuda':
             # 1. Extract edge features (gradient-based) for the whole batch
-            edge_features = self._extract_edge_features_batch(image_batch[:, 0:1, :, :])  # Y channel
-            batch_features.append(edge_features)
-        
-        with torch.cuda.stream(self.streams[1]):
+            with torch.cuda.stream(self.streams[0]):
+                edge_features = self._extract_edge_features_batch(image_batch[:, 0:1, :, :])  # Y channel
+                batch_features.append(edge_features)
+            
             # 2. Extract color correlation features
+            with torch.cuda.stream(self.streams[1]):
+                color_features = self._extract_color_features_batch(image_batch)
+                batch_features.append(color_features)
+                
+            # 3. Extract wavelet-based features
+            with torch.cuda.stream(self.streams[2]):
+                if wavelet_coeffs_batch:
+                    wavelet_features = self._extract_wavelet_features_batch(wavelet_coeffs_batch)
+                    batch_features.append(wavelet_features)
+            
+            # Synchronize streams
+            for stream in self.streams:
+                stream.synchronize()
+        else:
+            # Non-CUDA version - process sequentially
+            edge_features = self._extract_edge_features_batch(image_batch[:, 0:1, :, :])
+            batch_features.append(edge_features)
+            
             color_features = self._extract_color_features_batch(image_batch)
             batch_features.append(color_features)
             
-        with torch.cuda.stream(self.streams[2]):
-            # 3. Extract wavelet-based features
             if wavelet_coeffs_batch:
                 wavelet_features = self._extract_wavelet_features_batch(wavelet_coeffs_batch)
                 batch_features.append(wavelet_features)
-        
-        # Synchronize streams
-        for stream in self.streams:
-            stream.synchronize()
             
         # Concatenate all features along feature dimension
         feature_vectors = torch.cat(batch_features, dim=1)
         
         return feature_vectors
         
-    def _extract_edge_features_batch(self, y_batch):
+    def _extract_edge_features_batch(self, y_batch: torch.Tensor) -> torch.Tensor:
         """
         Extract edge features for a batch of Y channel images
         
@@ -103,8 +123,7 @@ class BatchFeatureExtractor:
         batch_size = y_batch.shape[0]
         
         # Add automatic mixed precision
-        dtype = torch.float16 if self.use_fp16 else torch.float32
-        with torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
+        with amp.autocast(device_type=self.device.type, enabled=self.use_fp16):
             # Apply Sobel filters to get gradients
             grad_x = F.conv2d(y_batch, self.sobel_x, padding=1)
             grad_y = F.conv2d(y_batch, self.sobel_y, padding=1)
@@ -143,7 +162,7 @@ class BatchFeatureExtractor:
             
         return all_edge_features
     
-    def _extract_color_features_batch(self, ycbcr_batch):
+    def _extract_color_features_batch(self, ycbcr_batch: torch.Tensor) -> torch.Tensor:
         """
         Extract color features from a batch of YCbCr images
         
@@ -155,7 +174,7 @@ class BatchFeatureExtractor:
         """
         batch_size = ycbcr_batch.shape[0]
         
-        with torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
+        with amp.autocast(device_type=self.device.type, enabled=self.use_fp16):
             # 1. Channel correlations
             # Reshape and compute correlations
             b, c, h, w = ycbcr_batch.shape
@@ -218,7 +237,7 @@ class BatchFeatureExtractor:
             
         return all_color_features
     
-    def _extract_wavelet_features_batch(self, wavelet_coeffs_batch):
+    def _extract_wavelet_features_batch(self, wavelet_coeffs_batch: List[Dict[str, Tuple]]) -> torch.Tensor:
         """
         Extract wavelet-based features from batch of wavelet coefficients
         
@@ -230,7 +249,7 @@ class BatchFeatureExtractor:
         """
         batch_size = len(wavelet_coeffs_batch)
         
-        with torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
+        with amp.autocast(device_type=self.device.type, enabled=self.use_fp16):
             # Preallocate tensor for wavelet features
             # We'll extract variance and energy from each subband
             feature_dim = 12  # 3 channels x 4 subbands (LL, LH, HL, HH)
@@ -270,3 +289,35 @@ class BatchFeatureExtractor:
                             feature_idx += 1
                 
         return wavelet_features
+
+
+def extract_features_from_wavelet(image_batch: torch.Tensor, 
+                                 wavelet_coeffs_batch: List[Dict[str, Tuple]],
+                                 device=None,
+                                 batch_size=16,
+                                 use_fp16=False) -> torch.Tensor:
+    """
+    Wrapper function to extract features from images and wavelet coefficients
+    
+    Args:
+        image_batch: Batch of images [B, C, H, W]
+        wavelet_coeffs_batch: List of wavelet coefficients
+        device: Computation device
+        batch_size: Batch size
+        use_fp16: Whether to use FP16
+        
+    Returns:
+        Feature vectors [B, feature_dim]
+    """
+    # Initialize feature extractor
+    extractor = BatchFeatureExtractor(
+        device=device,
+        batch_size=batch_size,
+        num_workers=4,
+        use_fp16=use_fp16
+    )
+    
+    # Extract features
+    features = extractor.extract_batch_features(image_batch, wavelet_coeffs_batch)
+    
+    return features
