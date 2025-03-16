@@ -2,306 +2,271 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import gc
+from concurrent.futures import ThreadPoolExecutor
 
-def extract_features(polar_coeffs, ycbcr_img):
+class BatchFeatureExtractor:
     """
-    Extract important features from decomposed image using optimized PyTorch with CUDA:
-    - SURF-like features with GPU acceleration
-    - Edge features
-    - Correlation between channels
-    - Color histogram
-    - Homogeneity
-    - Variance features
-    
-    Args:
-        polar_coeffs: Decomposed image using PDyWT (dictionary with wavelet coefficients)
-        ycbcr_img: Original YCbCr image (dictionary with 'y', 'cb', 'cr' keys)
-        
-    Returns:
-        Feature vector containing all extracted features
+    Optimized batch feature extractor for image forgery detection
+    Processes multiple images at once using efficient GPU operations
     """
-    # Force CUDA - no fallback
-    device = torch.device("cuda")
-    features = []
     
-    # Get channels from input
-    if isinstance(ycbcr_img, dict):
-        if 'y' in ycbcr_img and 'cb' in ycbcr_img and 'cr' in ycbcr_img:
-            # Get channels from dictionary
-            y_data = ycbcr_img['y']
-            cb_data = ycbcr_img['cb']
-            cr_data = ycbcr_img['cr']
+    def __init__(self, device=None, batch_size=16, num_workers=4, use_fp16=True):
+        """
+        Initialize the batch feature extractor
+        
+        Args:
+            device: PyTorch device (default: CUDA if available)
+            batch_size: Number of images to process in a batch
+            num_workers: Number of parallel CPU workers for data loading
+            use_fp16: Whether to use half precision (FP16) operations
+        """
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.use_fp16 = use_fp16
+        
+        # Pre-compute filters and tensors used in feature extraction
+        self._initialize_filters()
+        
+        # Create CUDA streams for overlapping operations
+        self.streams = [torch.cuda.Stream(device=self.device) for _ in range(3)]
+        
+    def _initialize_filters(self):
+        """Pre-compute filters and tensors used in feature extraction"""
+        # Sobel filters
+        self.sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                          dtype=torch.float16 if self.use_fp16 else torch.float32,
+                          device=self.device).view(1, 1, 3, 3)
+        self.sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                          dtype=torch.float16 if self.use_fp16 else torch.float32,
+                          device=self.device).view(1, 1, 3, 3)
+                          
+        # RGB to YCbCr transformation matrix
+        self.rgb_to_ycbcr = torch.tensor([
+            [0.299, 0.587, 0.114],      # Y
+            [-0.1687, -0.3313, 0.5],    # Cb
+            [0.5, -0.4187, -0.0813]     # Cr
+        ], dtype=torch.float16 if self.use_fp16 else torch.float32, device=self.device)
+        
+    def extract_batch_features(self, image_batch, wavelet_coeffs_batch):
+        """
+        Extract features from a batch of images
+        
+        Args:
+            image_batch: Batch of images as tensor [B, C, H, W]
+            wavelet_coeffs_batch: Batch of wavelet coefficients
             
-            # Convert to tensor and move to GPU
-            if not isinstance(y_data, torch.Tensor):
-                y_channel = torch.tensor(y_data, dtype=torch.float32, device=device)
-                cb_channel = torch.tensor(cb_data, dtype=torch.float32, device=device)
-                cr_channel = torch.tensor(cr_data, dtype=torch.float32, device=device)
-            else:
-                # Move to GPU if not already there
-                y_channel = y_data.to(device, non_blocking=True)
-                cb_channel = cb_data.to(device, non_blocking=True)
-                cr_channel = cr_data.to(device, non_blocking=True)
-        else:
-            raise ValueError(f"Dict doesn't contain expected keys. Available keys: {list(ycbcr_img.keys())}")
-    else:
-        raise TypeError(f"Expected dict for ycbcr_img, got {type(ycbcr_img)}")
-    
-    # Create a CUDA stream for concurrent operations
-    stream = torch.cuda.Stream()
-    
-    # Process within the stream
-    with torch.cuda.stream(stream):
-        # 1. SURF-like features using optimized PyTorch operations
-        y_channel_2d = y_channel.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+        Returns:
+            Tensor of feature vectors for the batch [B, feature_dim]
+        """
+        batch_size = image_batch.shape[0]
         
-        # Pre-compute Sobel filters on GPU
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                               dtype=torch.float32, device=device).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                               dtype=torch.float32, device=device).view(1, 1, 3, 3)
+        # List to store feature vectors for each image
+        batch_features = []
         
-        # Compute gradients using convolution with non-blocking memory transfer
-        grad_x = F.conv2d(y_channel_2d, sobel_x, padding=1)
-        grad_y = F.conv2d(y_channel_2d, sobel_y, padding=1)
+        # Process in streams to overlap computation
+        with torch.cuda.stream(self.streams[0]):
+            # 1. Extract edge features (gradient-based) for the whole batch
+            edge_features = self._extract_edge_features_batch(image_batch[:, 0:1, :, :])  # Y channel
+            batch_features.append(edge_features)
         
-        # Compute gradient magnitude (use in-place operations where possible)
-        grad_magnitude = torch.sqrt(grad_x.pow(2) + grad_y.pow(2))
-        
-        # Extract histogram of gradients from specific regions
-        h, w = y_channel.shape
-        regions = [(h//4*i, w//4*j, h//4*(i+1), w//4*(j+1)) for i in range(4) for j in range(4)]
-        
-        surf_like_features = []
-        for top, left, bottom, right in regions[:5]:  # Use first 5 regions for features
-            if top >= h or left >= w:
-                # Skip invalid regions
-                hist = torch.zeros(4, device=device)
-            else:
-                # Adjust bottom and right if needed
-                bottom = min(bottom, h)
-                right = min(right, w)
-                
-                region_magnitude = grad_magnitude[0, 0, top:bottom, left:right]
-                
-                # Optimize histogram computation
-                max_val = torch.max(region_magnitude).item() + 1e-8
-                hist = torch.histc(region_magnitude, bins=4, min=0, max=max_val)
-                
-                # Use in-place division for normalization
-                hist_sum = hist.sum().item() + 1e-8
-                hist.div_(hist_sum)
+        with torch.cuda.stream(self.streams[1]):
+            # 2. Extract color correlation features
+            color_features = self._extract_color_features_batch(image_batch)
+            batch_features.append(color_features)
             
-            surf_like_features.append(hist)
+        with torch.cuda.stream(self.streams[2]):
+            # 3. Extract wavelet-based features
+            if wavelet_coeffs_batch:
+                wavelet_features = self._extract_wavelet_features_batch(wavelet_coeffs_batch)
+                batch_features.append(wavelet_features)
         
-        # Concatenate features efficiently
-        surf_features = torch.cat(surf_like_features).flatten()
-        features.append(surf_features[:20])  # Take first 20 features
+        # Synchronize streams
+        for stream in self.streams:
+            stream.synchronize()
+            
+        # Concatenate all features along feature dimension
+        feature_vectors = torch.cat(batch_features, dim=1)
         
-        # 2. Edge features - just use the pre-computed gradient
-        edge_density = torch.mean(grad_magnitude).reshape(1)
-        features.append(edge_density)
+        return feature_vectors
         
-        # 3. Correlation between channels - optimized computation
-        def compute_correlation(x, y):
-            # Compute means
-            x_mean = x.mean()
-            y_mean = y.mean()
+    def _extract_edge_features_batch(self, y_batch):
+        """
+        Extract edge features for a batch of Y channel images
+        
+        Args:
+            y_batch: Batch of Y channel images [B, 1, H, W]
+            
+        Returns:
+            Edge features tensor [B, edge_feature_dim]
+        """
+        batch_size = y_batch.shape[0]
+        
+        # Add automatic mixed precision
+        dtype = torch.float16 if self.use_fp16 else torch.float32
+        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+            # Apply Sobel filters to get gradients
+            grad_x = F.conv2d(y_batch, self.sobel_x, padding=1)
+            grad_y = F.conv2d(y_batch, self.sobel_y, padding=1)
+            
+            # Compute gradient magnitude
+            grad_magnitude = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-8)
+            
+            # Global edge density feature
+            edge_density = torch.mean(grad_magnitude, dim=[1, 2, 3]).unsqueeze(1)
+            
+            # Regional edge features (divide into 3x3 grid)
+            b, c, h, w = grad_magnitude.shape
+            h_step, w_step = h // 3, w // 3
+            
+            regional_features = []
+            for i in range(3):
+                for j in range(3):
+                    h_start, h_end = i * h_step, (i + 1) * h_step
+                    w_start, w_end = j * w_step, (j + 1) * w_step
+                    
+                    # Handle edge cases
+                    if i == 2: h_end = h
+                    if j == 2: w_end = w
+                    
+                    # Extract region and compute features
+                    region = grad_magnitude[:, :, h_start:h_end, w_start:w_end]
+                    
+                    # Compute mean and variance of the region
+                    region_mean = torch.mean(region, dim=[1, 2, 3]).unsqueeze(1)
+                    region_var = torch.var(region, dim=[1, 2, 3]).unsqueeze(1)
+                    
+                    regional_features.extend([region_mean, region_var])
+            
+            # Concat all edge features
+            all_edge_features = torch.cat([edge_density] + regional_features, dim=1)
+            
+        return all_edge_features
+    
+    def _extract_color_features_batch(self, ycbcr_batch):
+        """
+        Extract color features from a batch of YCbCr images
+        
+        Args:
+            ycbcr_batch: Batch of YCbCr images [B, 3, H, W]
+            
+        Returns:
+            Color features tensor [B, color_feature_dim]
+        """
+        batch_size = ycbcr_batch.shape[0]
+        
+        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+            # 1. Channel correlations
+            # Reshape and compute correlations
+            b, c, h, w = ycbcr_batch.shape
+            flattened = ycbcr_batch.view(b, c, -1)  # [B, 3, H*W]
+            
+            # Mean of each channel
+            means = torch.mean(flattened, dim=2, keepdim=True)  # [B, 3, 1]
             
             # Center the data
-            x_centered = x - x_mean
-            y_centered = y - y_mean
+            centered = flattened - means
             
-            # Compute correlation
-            numerator = torch.sum(x_centered * y_centered)
-            denominator = torch.sqrt(torch.sum(x_centered**2) * torch.sum(y_centered**2) + 1e-8)
-            
-            return numerator / denominator
-        
-        # Flatten tensors for correlation
-        y_flat = y_channel.flatten()
-        cb_flat = cb_channel.flatten()
-        cr_flat = cr_channel.flatten()
-        
-        # Compute correlations
-        corr_y_cb = compute_correlation(y_flat, cb_flat).reshape(1)
-        corr_y_cr = compute_correlation(y_flat, cr_flat).reshape(1)
-        corr_cb_cr = compute_correlation(cb_flat, cr_flat).reshape(1)
-        
-        features.extend([corr_y_cb, corr_y_cr, corr_cb_cr])
-        
-        # 4. Color histogram features - optimized for GPU
-        color_hists = []
-        for channel in [y_channel, cb_channel, cr_channel]:
-            # Get max value for normalization
-            channel_max = channel.max().item()
-            
-            if channel_max > 0:
-                # Compute histogram
-                hist = torch.histc(channel, bins=8, min=0, max=channel_max + 1e-8)
-                # Normalize
-                hist.div_(hist.sum() + 1e-8)
-            else:
-                # Uniform distribution if channel is all zeros
-                hist = torch.ones(8, device=device) / 8
-                
-            color_hists.append(hist)
-        
-        features.extend(color_hists)
-        
-        # 5. GLCM-based homogeneity features - optimized GPU implementation
-        def calculate_homogeneity(channel, distance=1):
-            # Optimize for memory usage and speed
-            # Reduce channel to 8 gray levels
-            max_val = channel.max().item()
-            if max_val > 0:
-                channel_reduced = (channel / (max_val / 7.999)).long().clamp(0, 7)
-            else:
-                # Return perfect homogeneity for uniform channel
-                return torch.tensor(1.0, device=device).reshape(1)
-                
-            h, w = channel.shape
-            
-            # Return early if image too small
-            if w <= distance:
-                return torch.tensor(1.0, device=device).reshape(1)
-            
-            # Initialize GLCM
-            glcm = torch.zeros((8, 8), device=device)
-            
-            # Optimize computation with tensor operations
-            # Get all pixel pairs at specified distance
-            left_pixels = channel_reduced[:, :-distance].reshape(-1)
-            right_pixels = channel_reduced[:, distance:].reshape(-1)
-            
-            # Create index tensors for efficient histogram computation
-            batch_size = left_pixels.size(0)
-            indices = torch.stack([left_pixels, right_pixels], dim=1)
-            
-            # Create coordinate tensors
+            # Compute correlation matrix for each image in batch
+            corr_features = []
             for i in range(batch_size):
-                i_coord = indices[i, 0]
-                j_coord = indices[i, 1]
-                glcm[i_coord, j_coord] += 1
+                # Compute correlation between Y-Cb, Y-Cr and Cb-Cr
+                norm_y = torch.norm(centered[i, 0])
+                norm_cb = torch.norm(centered[i, 1])
+                norm_cr = torch.norm(centered[i, 2])
+                
+                # Avoid division by zero
+                eps = 1e-8
+                
+                corr_y_cb = torch.sum(centered[i, 0] * centered[i, 1]) / (norm_y * norm_cb + eps)
+                corr_y_cr = torch.sum(centered[i, 0] * centered[i, 2]) / (norm_y * norm_cr + eps)
+                corr_cb_cr = torch.sum(centered[i, 1] * centered[i, 2]) / (norm_cb * norm_cr + eps)
+                
+                corr_features.append(torch.stack([corr_y_cb, corr_y_cr, corr_cb_cr]))
             
-            # Normalize GLCM
-            glcm_sum = glcm.sum()
-            if glcm_sum > 0:
-                glcm.div_(glcm_sum)
-            else:
-                return torch.tensor(1.0, device=device).reshape(1)
+            corr_tensor = torch.stack(corr_features)
             
-            # Calculate homogeneity
-            i_indices, j_indices = torch.meshgrid(torch.arange(8, device=device), 
-                                                torch.arange(8, device=device), 
-                                                indexing='ij')
+            # 2. Color histogram features (simplified)
+            # Use 8 bins for each channel
+            histograms = []
+            for channel_idx in range(3):
+                channel_data = ycbcr_batch[:, channel_idx]
+                
+                # Compute min and max for each image in batch
+                channel_min = torch.min(channel_data.view(b, -1), dim=1)[0]
+                channel_max = torch.max(channel_data.view(b, -1), dim=1)[0] + 1e-8
+                
+                hist_features = []
+                for i in range(batch_size):
+                    # Normalize to 0-1 range
+                    normalized = (channel_data[i] - channel_min[i]) / (channel_max[i] - channel_min[i])
+                    
+                    # Compute histogram with 8 bins
+                    hist = torch.histc(normalized.flatten(), bins=8, min=0, max=1)
+                    
+                    # Normalize histogram
+                    hist = hist / torch.sum(hist)
+                    hist_features.append(hist)
+                
+                histograms.append(torch.stack(hist_features))
             
-            # Compute weights matrix
-            weights = 1.0 / (1.0 + torch.abs(i_indices - j_indices).float())
+            # Concatenate histograms [B, 3*8]
+            hist_tensor = torch.cat([h.reshape(batch_size, -1) for h in histograms], dim=1)
             
-            # Compute homogeneity score
-            homogeneity = torch.sum(glcm * weights).reshape(1)
+            # Combine all color features
+            all_color_features = torch.cat([corr_tensor, hist_tensor], dim=1)
             
-            return homogeneity
+        return all_color_features
+    
+    def _extract_wavelet_features_batch(self, wavelet_coeffs_batch):
+        """
+        Extract wavelet-based features from batch of wavelet coefficients
         
-        # Compute homogeneity for each channel
-        homogeneity_features = [
-            calculate_homogeneity(y_channel),
-            calculate_homogeneity(cb_channel),
-            calculate_homogeneity(cr_channel)
-        ]
-        features.extend(homogeneity_features)
+        Args:
+            wavelet_coeffs_batch: List of wavelet coefficient dictionaries, one per image
+            
+        Returns:
+            Wavelet features tensor [B, wavelet_feature_dim]
+        """
+        batch_size = len(wavelet_coeffs_batch)
         
-        # 6. Variance features from wavelet coefficients - optimized error handling
-        if isinstance(polar_coeffs, dict):
-            for channel_name, coeffs in polar_coeffs.items():
-                try:
-                    # Handle different coefficient structures
-                    if isinstance(coeffs, tuple):
-                        if len(coeffs) == 2:
-                            ll, others = coeffs
-                            
+        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+            # Preallocate tensor for wavelet features
+            # We'll extract variance and energy from each subband
+            feature_dim = 12  # 3 channels x 4 subbands (LL, LH, HL, HH)
+            wavelet_features = torch.zeros((batch_size, feature_dim), 
+                                          dtype=torch.float16 if self.use_fp16 else torch.float32,
+                                          device=self.device)
+            
+            for i, coeffs_dict in enumerate(wavelet_coeffs_batch):
+                feature_idx = 0
+                
+                # Process each color channel
+                for channel in ['y', 'cb', 'cr']:
+                    if channel in coeffs_dict:
+                        coeff_tuple = coeffs_dict[channel]
+                        
+                        # Extract all 4 subbands (LL, LH, HL, HH)
+                        if isinstance(coeff_tuple, tuple) and len(coeff_tuple) >= 4:
+                            subbands = coeff_tuple[:4]
+                        elif isinstance(coeff_tuple, tuple) and len(coeff_tuple) == 2:
+                            # Handle case where coeffs are (LL, (LH, HL, HH))
+                            ll, others = coeff_tuple
                             if isinstance(others, tuple) and len(others) == 3:
-                                lh, hl, hh = others
+                                subbands = (ll,) + others
                             else:
-                                # Try to extract by index
-                                try:
-                                    lh, hl, hh = others[0], others[1], others[2]
-                                except:
-                                    if isinstance(ll, torch.Tensor):
-                                        lh = hl = hh = torch.zeros_like(ll)
-                                    else:
-                                        lh = hl = hh = 0
-                        elif len(coeffs) >= 4:
-                            ll, lh, hl, hh = coeffs[0], coeffs[1], coeffs[2], coeffs[3]
+                                # Skip if format is unknown
+                                continue
                         else:
-                            raise ValueError(f"Cannot extract coefficients from tuple of length {len(coeffs)}")
-                    else:
-                        # Try to extract from list-like structure
-                        if hasattr(coeffs, '__getitem__') and hasattr(coeffs, '__len__'):
-                            ll = coeffs[0]
-                            if len(coeffs) >= 4:
-                                lh, hl, hh = coeffs[1], coeffs[2], coeffs[3]
-                            else:
-                                raise ValueError("Cannot extract all required coefficients")
-                        else:
-                            raise ValueError("Unsupported coefficient structure")
-                    
-                    # Convert to PyTorch tensors on GPU
-                    if not isinstance(ll, torch.Tensor):
-                        ll_t = torch.tensor(ll, dtype=torch.float32, device=device)
-                        lh_t = torch.tensor(lh, dtype=torch.float32, device=device)
-                        hl_t = torch.tensor(hl, dtype=torch.float32, device=device)
-                        hh_t = torch.tensor(hh, dtype=torch.float32, device=device)
-                    else:
-                        # Move to GPU with non-blocking transfer
-                        ll_t = ll.to(device, non_blocking=True)
-                        lh_t = lh.to(device, non_blocking=True)
-                        hl_t = hl.to(device, non_blocking=True)
-                        hh_t = hh.to(device, non_blocking=True)
-                    
-                    # Compute variance efficiently
-                    var_features = [
-                        torch.var(ll_t).reshape(1),
-                        torch.var(lh_t).reshape(1),
-                        torch.var(hl_t).reshape(1),
-                        torch.var(hh_t).reshape(1)
-                    ]
-                    features.extend(var_features)
-                    
-                except Exception as e:
-                    # Add zeros as fallback
-                    features.extend([torch.zeros(1, device=device) for _ in range(4)])
-        else:
-            # Skip wavelet coefficient processing if structure is unknown
-            features.extend([torch.zeros(1, device=device) for _ in range(4)])
-    
-    # Ensure all CUDA operations are completed
-    stream.synchronize()
-    
-    # Process features for return
-    processed_features = []
-    for f in features:
-        if isinstance(f, torch.Tensor):
-            # Move to CPU and convert to numpy
-            processed_features.append(f.cpu().numpy())
-        elif isinstance(f, list):
-            # Process list of tensors
-            for item in f:
-                if isinstance(item, torch.Tensor):
-                    processed_features.append(item.cpu().numpy())
-                else:
-                    processed_features.append(np.array([item]))
-        else:
-            processed_features.append(np.array([f]))
-    
-    # Concatenate all features
-    feature_vector = np.concatenate([f.flatten() for f in processed_features])
-    
-    # Clean up unused tensors
-    del features, processed_features
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    # Return as a row vector
-    return feature_vector.reshape(1, -1)
+                            # Skip if format is unknown
+                            continue
+                            
+                        # Calculate variance for each subband
+                        for subband in subbands:
+                            if isinstance(subband, torch.Tensor):
+                                # Calculate variance
+                                variance = torch.var(subband)
+                                wavelet_features[i, feature_idx] = variance
+                            feature_idx += 1
+                
+        return wavelet_features
