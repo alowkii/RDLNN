@@ -6,7 +6,7 @@ from .data_handling import precompute_features, load_and_verify_features
 from .preprocessing import preprocess_image
 from .image_decomposition import polar_dyadic_wavelet_transform
 from .feature_extraction import BatchFeatureExtractor
-from .BatchFeatureExtractor import OptimizedBatchProcessor
+from .batch_processor import OptimizedBatchProcessor
 
 # Define what gets imported with "from modules import *"
 __all__ = [
@@ -15,6 +15,6 @@ __all__ = [
     'load_and_verify_features',
     'preprocess_image',
     'polar_dyadic_wavelet_transform',
-    'BatchFeatureExtractor',
+    'batch_processor',
     'OptimizedBatchProcessor'
 ]

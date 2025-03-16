@@ -1,12 +1,19 @@
+"""
+Optimized batch processor for image forgery detection
+"""
+
 import os
 import torch
 import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import gc
+from typing import Dict, List, Optional, Tuple, Any, Union
+
 from modules.preprocessing import preprocess_image
-from modules.image_decomposition import polar_dyadic_wavelet_transform
-from modules.feature_extraction import BatchFeatureExtractor
+from modules.image_decomposition import perform_wavelet_transform
+from modules.feature_extraction import extract_features_from_wavelet
+from modules.utils import logger, clean_cuda_memory
 
 class OptimizedBatchProcessor:
     """
@@ -31,26 +38,25 @@ class OptimizedBatchProcessor:
         self.model = model
         
         # Create multiple CUDA streams for overlapping operations
-        self.streams = {
-            'preprocess': torch.cuda.Stream(device=self.device),
-            'transform': torch.cuda.Stream(device=self.device),
-            'features': torch.cuda.Stream(device=self.device),
-            'predict': torch.cuda.Stream(device=self.device)
-        }
-        
-        # Initialize the batch feature extractor
-        self.feature_extractor = BatchFeatureExtractor(
-            device=self.device,
-            batch_size=batch_size,
-            num_workers=self.num_workers,
-            use_fp16=use_fp16
-        )
+        if self.device.type == 'cuda':
+            self.streams = {
+                'preprocess': torch.cuda.Stream(device=self.device),
+                'transform': torch.cuda.Stream(device=self.device),
+                'features': torch.cuda.Stream(device=self.device),
+                'predict': torch.cuda.Stream(device=self.device)
+            }
+        else:
+            self.streams = {k: None for k in ['preprocess', 'transform', 'features', 'predict']}
         
         # Set up mixed precision if enabled
         self.amp_dtype = torch.float16 if use_fp16 else torch.float32
-        self.scaler = torch.cuda.amp.GradScaler() if use_fp16 else None
+        self.scaler = torch.cuda.amp.GradScaler() if use_fp16 and self.device.type == 'cuda' else None
+        
+        logger.info(f"Initialized batch processor with batch size {batch_size} on {self.device}")
+        if self.use_fp16:
+            logger.info("Using mixed precision (FP16)")
     
-    def precompute_features(self, directory, label=None, save_path=None):
+    def precompute_features(self, directory: str, label=None, save_path=None) -> Dict[str, Any]:
         """
         Precompute and optionally save feature vectors for all images in a directory
         
@@ -66,7 +72,7 @@ class OptimizedBatchProcessor:
                       if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
         
         num_images = len(image_files)
-        print(f"Found {num_images} images in {directory}")
+        logger.info(f"Found {num_images} images in {directory}")
         
         # Allocate results
         results = {
@@ -97,7 +103,7 @@ class OptimizedBatchProcessor:
                 pbar.update(len(batch_paths))
                 
                 # Clean up GPU memory after each batch
-                torch.cuda.empty_cache()
+                clean_cuda_memory()
         
         # Combine features into a single array
         if results['features']:
@@ -112,11 +118,11 @@ class OptimizedBatchProcessor:
                     features=results['features'],
                     labels=results.get('labels', [])
                 )
-                print(f"Saved {len(results['paths'])} feature vectors to {save_path}")
+                logger.info(f"Saved {len(results['paths'])} feature vectors to {save_path}")
         
         return results
     
-    def _process_image_batch(self, image_paths):
+    def _process_image_batch(self, image_paths: List[str]) -> Optional[torch.Tensor]:
         """
         Process a batch of images and extract features
         
@@ -130,7 +136,7 @@ class OptimizedBatchProcessor:
             batch_size = len(image_paths)
             
             # STAGE 1: Preprocess images in parallel (CPU) and move to GPU
-            with torch.cuda.stream(self.streams['preprocess']):
+            with torch.cuda.stream(self.streams['preprocess']) if self.device.type == 'cuda' else nullcontext():
                 # Use ThreadPoolExecutor for parallel preprocessing
                 with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
                     ycbcr_batch = list(executor.map(preprocess_image, image_paths))
@@ -139,6 +145,7 @@ class OptimizedBatchProcessor:
                 ycbcr_batch = [img for img in ycbcr_batch if img is not None]
                 
                 if not ycbcr_batch:
+                    logger.warning("No valid images in batch")
                     return None
                 
                 # Get consistent dimensions for batching
@@ -147,52 +154,50 @@ class OptimizedBatchProcessor:
                 
                 # Stack into a single batch tensor
                 if not ycbcr_batch:
+                    logger.warning("No images with consistent dimensions in batch")
                     return None
                     
                 ycbcr_tensor = torch.stack(ycbcr_batch)  # [B, C, H, W]
                 
             # STAGE 2: Apply wavelet transform
-            with torch.cuda.stream(self.streams['transform']):
+            with torch.cuda.stream(self.streams['transform']) if self.device.type == 'cuda' else nullcontext():
                 # Record the current stream to manage synchronization
-                self.streams['preprocess'].synchronize()
+                if self.device.type == 'cuda':
+                    self.streams['preprocess'].synchronize()
                 
                 # Apply wavelet transform to each image in batch
                 pdywt_batch = []
                 for i in range(len(ycbcr_tensor)):
-                    pdywt_coeffs = polar_dyadic_wavelet_transform(ycbcr_tensor[i])
+                    pdywt_coeffs = perform_wavelet_transform(ycbcr_tensor[i])
                     pdywt_batch.append(pdywt_coeffs)
             
             # STAGE 3: Extract features
-            with torch.cuda.stream(self.streams['features']):
+            with torch.cuda.stream(self.streams['features']) if self.device.type == 'cuda' else nullcontext():
                 # Ensure wavelet transform is complete
-                self.streams['transform'].synchronize()
+                if self.device.type == 'cuda':
+                    self.streams['transform'].synchronize()
                 
-                # Prepare image batch for feature extraction
-                ycbcr_dict_batch = []
-                for i in range(len(ycbcr_tensor)):
-                    ycbcr_dict = {
-                        'y': ycbcr_tensor[i, 0],
-                        'cb': ycbcr_tensor[i, 1],
-                        'cr': ycbcr_tensor[i, 2]
-                    }
-                    ycbcr_dict_batch.append(ycbcr_dict)
-                
-                # Use the BatchFeatureExtractor for efficient feature extraction
-                with torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
-                    feature_vectors = self.feature_extractor.extract_batch_features(
-                        ycbcr_tensor, pdywt_batch
+                # Use the feature extractor for efficient feature extraction
+                with torch.amp.autocast(device_type='cuda' if self.device.type == 'cuda' else 'cpu', enabled=self.use_fp16):
+                    feature_vectors = extract_features_from_wavelet(
+                        ycbcr_tensor, 
+                        pdywt_batch,
+                        device=self.device,
+                        batch_size=self.batch_size,
+                        use_fp16=self.use_fp16
                     )
             
             # Ensure all operations are complete
-            self.streams['features'].synchronize()
+            if self.device.type == 'cuda':
+                self.streams['features'].synchronize()
             
             return feature_vectors
             
         except Exception as e:
-            print(f"Error processing batch: {e}")
+            logger.error(f"Error processing batch: {e}")
             return None
         
-    def batch_predict(self, features):
+    def batch_predict(self, features: Union[np.ndarray, torch.Tensor]) -> Tuple[np.ndarray, np.ndarray]:
         """
         Make predictions on a batch of feature vectors
         
@@ -223,8 +228,8 @@ class OptimizedBatchProcessor:
                 features = torch.tensor(features_scaled, dtype=torch.float32, device=self.device)
             
             # Make predictions with mixed precision
-            with torch.no_grad(), torch.cuda.stream(self.streams['predict']), \
-                torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
+            with torch.no_grad(), torch.cuda.stream(self.streams['predict']) if self.device.type == 'cuda' else nullcontext(), \
+                torch.amp.autocast(device_type='cuda' if self.device.type == 'cuda' else 'cpu', enabled=self.use_fp16):
                 confidences = self.model.model(features).squeeze(-1)
             
             # Convert to binary predictions
@@ -239,13 +244,13 @@ class OptimizedBatchProcessor:
             return predictions.cpu().numpy(), confidences.cpu().numpy()
             
         except Exception as e:
-            print(f"Error during batch prediction: {e}")
+            logger.error(f"Error during batch prediction: {e}")
             if self.device.type == 'cuda':
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
             return None, None
             
-    def process_directory(self, directory, results_file=None):
+    def process_directory(self, directory: str, results_file=None) -> Dict[str, List[str]]:
         """
         Process all images in a directory and classify them as authentic or forged
         
@@ -257,19 +262,19 @@ class OptimizedBatchProcessor:
             Dictionary with results
         """
         # First, precompute features for all images
-        print("Precomputing features for all images...")
+        logger.info("Precomputing features for all images...")
         precomputed = self.precompute_features(directory)
         
         if not precomputed['features'].size:
-            print("No valid features were extracted.")
+            logger.error("No valid features were extracted.")
             return {'authentic': [], 'forged': [], 'errors': []}
         
         # Make predictions on all features at once
-        print("Making predictions on all images...")
+        logger.info("Making predictions on all images...")
         predictions, confidences = self.batch_predict(precomputed['features'])
         
         if predictions is None:
-            print("Error during prediction")
+            logger.error("Error during prediction")
             return {'authentic': [], 'forged': [], 'errors': precomputed['paths']}
         
         # Organize results
@@ -289,10 +294,10 @@ class OptimizedBatchProcessor:
                 pbar.update(1)
         
         # Print summary
-        print("\nProcessing complete!")
-        print(f"Authentic images: {len(results['authentic'])}")
-        print(f"Forged images: {len(results['forged'])}")
-        print(f"Errors: {len(results['errors'])}")
+        logger.info("\nProcessing complete!")
+        logger.info(f"Authentic images: {len(results['authentic'])}")
+        logger.info(f"Forged images: {len(results['forged'])}")
+        logger.info(f"Errors: {len(results['errors'])}")
         
         # Save results if file path provided
         if results_file:
@@ -310,6 +315,15 @@ class OptimizedBatchProcessor:
                 for img in results['errors']:
                     f.write(f"{img}\n")
             
-            print(f"Results saved to {results_file}")
+            logger.info(f"Results saved to {results_file}")
         
         return results
+
+
+class nullcontext:
+    """Simple nullcontext implementation for Python < 3.7"""
+    def __enter__(self):
+        return None
+    
+    def __exit__(self, *excinfo):
+        pass
