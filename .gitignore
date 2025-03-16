@@ -11,7 +11,7 @@ env/
 ENV/
 
 # Ignore data-related files and directories
-Data/
+data/
 
 # Ignore generated folders and their contents
 features/
