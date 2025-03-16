@@ -1,92 +1,51 @@
+#!/usr/bin/env python3
+"""
+Image Forgery Detection System - Main entry point
+Provides a CLI interface for different modes of operation
+"""
+
 import os
 import argparse
 import torch
-import numpy as np
 import time
-from pathlib import Path
-import gc
-import matplotlib.pyplot as plt
 import signal
 import sys
+import gc
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
 
-# Import the improved modules
+# Import modules
 from modules.rdlnn import RegressionDLNN
 from modules.data_handling import precompute_features, load_and_verify_features
 from modules.preprocessing import preprocess_image
-
-# Improved signal_handler in main.py
-def signal_handler(sig, frame):
-    """
-    Handle signals for graceful shutdown
-    Ensures proper CUDA cleanup before exit
-    
-    Args:
-        sig: Signal number
-        frame: Current stack frame
-    """
-    print('Cleaning up resources before exit...')
-    
-    # Flush any open file handles
-    sys.stdout.flush()
-    sys.stderr.flush()
-    
-    # Clean up CUDA resources if available
-    if torch.cuda.is_available():
-        # Synchronize all CUDA streams first
-        torch.cuda.synchronize()
-        # Then empty cache
-        torch.cuda.empty_cache()
-    
-    # Collect Python garbage
-    gc.collect()
-    
-    print('Cleanup complete. Exiting...')
-    sys.exit(0)
-
-# Register signal handlers
-signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+from modules.image_decomposition import perform_wavelet_transform
+from modules.feature_extraction import extract_features_from_wavelet
+from modules.batch_processor import OptimizedBatchProcessor
+from modules.utils import setup_signal_handlers, plot_training_history, setup_logging, logger
 
 def main():
-    parser = argparse.ArgumentParser(description='Image Forgery Detection System')
-    parser.add_argument('--mode', choices=['train', 'test', 'precompute', 'single', 'analyze'], required=True, 
-                        help='Operating mode: train, test, precompute features, single image test, or analyze features')
-    parser.add_argument('--input_dir', type=str,
-                        help='Directory containing input images')
-    parser.add_argument('--image_path', type=str,
-                        help='Path to single image for testing')
-    parser.add_argument('--output_dir', type=str, default='results',
-                        help='Directory to save results')
-    parser.add_argument('--model_path', type=str, default='models/forgery_detection_model.pth',
-                        help='Path to save/load model')
-    parser.add_argument('--features_path', type=str, default='features/precomputed_features.npz',
-                        help='Path to save/load precomputed features')
-    parser.add_argument('--batch_size', type=int, default=16,
-                        help='Batch size for processing')
-    parser.add_argument('--workers', type=int, default=4,
-                        help='Number of worker threads for data loading')
-    parser.add_argument('--fp16', action='store_true',
-                        help='Use half precision (FP16) operations')
-    parser.add_argument('--authentic_dir', type=str,
-                        help='Directory containing authentic images (for training)')
-    parser.add_argument('--forged_dir', type=str,
-                        help='Directory containing forged images (for training)')
-    parser.add_argument('--epochs', type=int, default=20,
-                        help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=0.001,
-                        help='Learning rate for training')
-    
-    args = parser.parse_args()
+    """Main entry point for the application"""
+    # Parse command line arguments
+    args = parse_arguments()
     
     # Create output directories
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
     os.makedirs(os.path.dirname(args.features_path), exist_ok=True)
     
+    # Set up logging
+    setup_logging(args.output_dir)
+    logger.info(f"Starting image forgery detection in {args.mode} mode")
+    
+    # Set up signal handlers for graceful shutdown
+    setup_signal_handlers()
+    
     # Check for CUDA
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device} - CUDA available: {torch.cuda.is_available()}")
     
+    # Execute the requested mode
     if args.mode == 'precompute':
         precompute_mode(args)
     elif args.mode == 'train':
@@ -97,14 +56,93 @@ def main():
         test_single_image(args)
     elif args.mode == 'analyze':
         analyze_features(args)
+    
+    logger.info("Operation completed successfully")
 
-def precompute_mode(args):
-    """Precompute features for training or testing"""
-    print(f"Precomputing features with batch size {args.batch_size}...")
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Image Forgery Detection System',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument('--mode', 
+                        choices=['train', 'test', 'precompute', 'single', 'analyze'], 
+                        required=True, 
+                        help='Operating mode: train, test, precompute features, test single image, or analyze features')
+    
+    parser.add_argument('--input_dir', 
+                        type=str,
+                        help='Directory containing input images')
+    
+    parser.add_argument('--image_path', 
+                        type=str,
+                        help='Path to single image for testing')
+    
+    parser.add_argument('--output_dir', 
+                        type=str, 
+                        default='results',
+                        help='Directory to save results')
+    
+    parser.add_argument('--model_path', 
+                        type=str, 
+                        default='models/forgery_detection_model.pth',
+                        help='Path to save/load model')
+    
+    parser.add_argument('--features_path', 
+                        type=str, 
+                        default='features/precomputed_features.npz',
+                        help='Path to save/load precomputed features')
+    
+    parser.add_argument('--batch_size', 
+                        type=int, 
+                        default=16,
+                        help='Batch size for processing')
+    
+    parser.add_argument('--workers', 
+                        type=int, 
+                        default=4,
+                        help='Number of worker threads for data loading')
+    
+    parser.add_argument('--fp16', 
+                        action='store_true',
+                        help='Use half precision (FP16) operations')
+    
+    parser.add_argument('--authentic_dir', 
+                        type=str,
+                        help='Directory containing authentic images (for training)')
+    
+    parser.add_argument('--forged_dir', 
+                        type=str,
+                        help='Directory containing forged images (for training)')
+    
+    parser.add_argument('--epochs', 
+                        type=int, 
+                        default=20,
+                        help='Number of training epochs')
+    
+    parser.add_argument('--learning_rate', 
+                        type=float, 
+                        default=0.001,
+                        help='Learning rate for training')
+    
+    parser.add_argument('--debug', 
+                        action='store_true', 
+                        help='Enable debug mode with additional logging')
+    
+    return parser.parse_args()
+
+def precompute_mode(args: argparse.Namespace) -> None:
+    """Precompute features for training or testing
+    
+    Args:
+        args: Command line arguments
+    """
+    logger.info(f"Precomputing features with batch size {args.batch_size}...")
     
     # Process authentic images if provided
     if args.authentic_dir:
-        print(f"\nProcessing authentic images from {args.authentic_dir}")
+        logger.info(f"Processing authentic images from {args.authentic_dir}")
         authentic_features = precompute_features(
             directory=args.authentic_dir,
             label=0,  # 0 = authentic
@@ -116,7 +154,7 @@ def precompute_mode(args):
     
     # Process forged images if provided
     if args.forged_dir:
-        print(f"\nProcessing forged images from {args.forged_dir}")
+        logger.info(f"Processing forged images from {args.forged_dir}")
         forged_features = precompute_features(
             directory=args.forged_dir,
             label=1,  # 1 = forged
@@ -128,7 +166,7 @@ def precompute_mode(args):
     
     # Process general input directory if provided
     if args.input_dir and args.input_dir != args.authentic_dir and args.input_dir != args.forged_dir:
-        print(f"\nProcessing images from {args.input_dir}")
+        logger.info(f"Processing images from {args.input_dir}")
         precompute_features(
             directory=args.input_dir,
             batch_size=args.batch_size,
@@ -139,10 +177,11 @@ def precompute_mode(args):
     
     # Combine authentic and forged features if both were computed
     if args.authentic_dir and args.forged_dir:
-        print("\nCombining authentic and forged features...")
+        logger.info("Combining authentic and forged features...")
+        
         # Load the individual feature files
-        authentic_data = np.load(f"{os.path.splitext(args.features_path)[0]}_authentic.npz")
-        forged_data = np.load(f"{os.path.splitext(args.features_path)[0]}_forged.npz")
+        authentic_data = np.load(f"{os.path.splitext(args.features_path)[0]}_authentic.npz", allow_pickle=True)
+        forged_data = np.load(f"{os.path.splitext(args.features_path)[0]}_forged.npz", allow_pickle=True)
         
         # Extract data
         authentic_features = authentic_data['features']
@@ -154,6 +193,7 @@ def precompute_mode(args):
         forged_labels = forged_data['labels']
         
         # Combine the data
+        import numpy as np
         combined_features = np.vstack([authentic_features, forged_features])
         combined_paths = list(authentic_paths) + list(forged_paths)
         combined_labels = list(authentic_labels) + list(forged_labels)
@@ -166,42 +206,48 @@ def precompute_mode(args):
             labels=combined_labels
         )
         
-        print(f"Saved combined features to {args.features_path}")
-        print(f"Combined dataset: {len(combined_features)} samples "
+        logger.info(f"Saved combined features to {args.features_path}")
+        logger.info(f"Combined dataset: {len(combined_features)} samples "
               f"({len(authentic_features)} authentic, {len(forged_features)} forged)")
 
-def train_mode(args):
-    """Train the model using precomputed features"""
+def train_mode(args: argparse.Namespace) -> None:
+    """Train the model using precomputed features
+    
+    Args:
+        args: Command line arguments
+    """
+    import numpy as np
+    
     if not (args.authentic_dir and args.forged_dir) and not os.path.exists(args.features_path):
-        print("Error: For training, either provide authentic_dir and forged_dir arguments, "
+        logger.error("For training, either provide authentic_dir and forged_dir arguments, "
               "or precompute features first and provide features_path.")
         return
     
     # Load or compute features
     if not os.path.exists(args.features_path):
-        print("Precomputing features for training...")
+        logger.info("Precomputing features for training...")
         precompute_mode(args)
     
     # Load and verify features
     features, labels, paths = load_and_verify_features(args.features_path)
     
     if len(features) == 0:
-        print("Error: No valid features found. Please check your data.")
+        logger.error("No valid features found. Please check your data.")
         return
     
     if len(labels) == 0:
-        print("Error: No labels found. Please make sure your feature file includes labels.")
+        logger.error("No labels found. Please make sure your feature file includes labels.")
         return
     
     # Check class balance
     class_counts = np.bincount(labels.astype(int))
     if len(class_counts) < 2:
-        print(f"Error: Only found {len(class_counts)} classes. Need at least 2 classes for training.")
+        logger.error(f"Only found {len(class_counts)} classes. Need at least 2 classes for training.")
         return
     
     # Create and train the model
     input_dim = features.shape[1]
-    print(f"Creating model with input dimension: {input_dim}")
+    logger.info(f"Creating model with input dimension: {input_dim}")
     model = RegressionDLNN(input_dim)
     
     # Train the model
@@ -219,16 +265,22 @@ def train_mode(args):
     model.save(args.model_path)
     
     # Plot training history
-    plot_history(history, args.output_dir)
+    plot_training_history(history, args.output_dir)
 
-def test_mode(args):
-    """Test the model on images in the input directory"""
+def test_mode(args: argparse.Namespace) -> None:
+    """Test the model on images in the input directory
+    
+    Args:
+        args: Command line arguments
+    """
+    import numpy as np
+    
     if not os.path.exists(args.model_path):
-        print(f"Error: Model not found at {args.model_path}")
+        logger.error(f"Error: Model not found at {args.model_path}")
         return
     
     if not args.input_dir:
-        print("Error: Please provide --input_dir argument for testing")
+        logger.error("Error: Please provide --input_dir argument for testing")
         return
     
     # Load the model
@@ -237,7 +289,7 @@ def test_mode(args):
     # Precompute features if not already done
     features_file = args.features_path
     if not os.path.exists(features_file):
-        print("Precomputing features for test images...")
+        logger.info("Precomputing features for test images...")
         precompute_features(
             directory=args.input_dir,
             batch_size=args.batch_size,
@@ -250,7 +302,7 @@ def test_mode(args):
     test_features, test_labels, test_paths = load_and_verify_features(features_file)
     
     if len(test_features) == 0:
-        print("Error: No valid features found for testing.")
+        logger.error("Error: No valid features found for testing.")
         return
     
     # Make predictions
@@ -291,15 +343,15 @@ def test_mode(args):
             f.write("\n")
     
     # Print summary
-    print("\nProcessing complete!")
-    print(f"Processed {len(predictions)} images in {elapsed_time:.2f} seconds")
-    print(f"Authentic images: {len(results['authentic'])}")
-    print(f"Forged images: {len(results['forged'])}")
+    logger.info("\nProcessing complete!")
+    logger.info(f"Processed {len(predictions)} images in {elapsed_time:.2f} seconds")
+    logger.info(f"Authentic images: {len(results['authentic'])}")
+    logger.info(f"Forged images: {len(results['forged'])}")
     
     # Compute accuracy if we have labels
     if len(test_labels) > 0:
         accuracy = np.mean(predictions == test_labels)
-        print(f"Accuracy: {accuracy:.4f}")
+        logger.info(f"Accuracy: {accuracy:.4f}")
         
         # Compute confusion matrix
         tp = np.sum((predictions == 1) & (test_labels == 1))
@@ -307,42 +359,46 @@ def test_mode(args):
         fp = np.sum((predictions == 1) & (test_labels == 0))
         fn = np.sum((predictions == 0) & (test_labels == 1))
         
-        print("\nConfusion Matrix:")
-        print(f"True Positive: {tp}")
-        print(f"True Negative: {tn}")
-        print(f"False Positive: {fp}")
-        print(f"False Negative: {fn}")
+        logger.info("\nConfusion Matrix:")
+        logger.info(f"True Positive: {tp}")
+        logger.info(f"True Negative: {tn}")
+        logger.info(f"False Positive: {fp}")
+        logger.info(f"False Negative: {fn}")
         
         # Calculate precision, recall, and F1 score
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
         
-        print(f"Precision: {precision:.4f}")
-        print(f"Recall: {recall:.4f}")
-        print(f"F1 Score: {f1:.4f}")
+        logger.info(f"Precision: {precision:.4f}")
+        logger.info(f"Recall: {recall:.4f}")
+        logger.info(f"F1 Score: {f1:.4f}")
     
-    print(f"Results saved to {results_file}")
+    logger.info(f"Results saved to {results_file}")
 
-def test_single_image(args):
-    """Test the model on a single image"""
+def test_single_image(args: argparse.Namespace) -> None:
+    """Test the model on a single image
+    
+    Args:
+        args: Command line arguments
+    """
     if not args.image_path:
-        print("Error: Please provide --image_path argument for single image testing")
+        logger.error("Error: Please provide --image_path argument for single image testing")
         return
     
     if not os.path.exists(args.model_path):
-        print(f"Error: Model not found at {args.model_path}")
+        logger.error(f"Error: Model not found at {args.model_path}")
         return
     
     if not os.path.exists(args.image_path):
-        print(f"Error: Image not found at {args.image_path}")
+        logger.error(f"Error: Image not found at {args.image_path}")
         return
     
     # Load the model
     model = RegressionDLNN.load(args.model_path)
     
     # Process the image
-    print(f"Processing single image: {args.image_path}")
+    logger.info(f"Processing single image: {args.image_path}")
     start_time = time.time()
     
     try:
@@ -350,31 +406,27 @@ def test_single_image(args):
         ycbcr_tensor = preprocess_image(args.image_path)
         
         if ycbcr_tensor is None:
-            print("Error: Failed to preprocess image")
+            logger.error("Error: Failed to preprocess image")
             return
         
         # Add batch dimension
         ycbcr_tensor = ycbcr_tensor.unsqueeze(0)
         
         # Apply wavelet transform
-        from modules.imageDecomposition import polar_dyadic_wavelet_transform
-        pdywt_coeffs = polar_dyadic_wavelet_transform(ycbcr_tensor[0])
+        pdywt_coeffs = perform_wavelet_transform(ycbcr_tensor[0])
         
         # Extract features
-        from modules.featureExtraction import BatchFeatureExtractor
-        feature_extractor = BatchFeatureExtractor(
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        feature_vector = extract_features_from_wavelet(
+            ycbcr_tensor, 
+            [pdywt_coeffs],
+            device=device,
             batch_size=1,
-            num_workers=1,
             use_fp16=args.fp16
         )
         
-        feature_vector = feature_extractor.extract_batch_features(
-            ycbcr_tensor, [pdywt_coeffs]
-        )
-        
         if feature_vector is None:
-            print("Error: Failed to extract features")
+            logger.error("Error: Failed to extract features")
             return
         
         # Make prediction
@@ -385,8 +437,8 @@ def test_single_image(args):
         confidence = confidences[0]
         result = "FORGED" if prediction == 1 else "AUTHENTIC"
         
-        print(f"\nResult: {result}")
-        print(f"Confidence: {confidence:.4f}")
+        logger.info(f"\nResult: {result}")
+        logger.info(f"Confidence: {confidence:.4f}")
         
         # Save the result
         result_file = os.path.join(args.output_dir, f"{os.path.splitext(os.path.basename(args.image_path))[0]}_result.txt")
@@ -395,40 +447,46 @@ def test_single_image(args):
             f.write(f"Result: {result}\n")
             f.write(f"Confidence: {confidence:.4f}\n")
         
-        print(f"Result saved to {result_file}")
+        logger.info(f"Result saved to {result_file}")
         
     except Exception as e:
-        print(f"Error processing image: {e}")
+        logger.error(f"Error processing image: {e}", exc_info=args.debug)
     
     elapsed_time = time.time() - start_time
-    print(f"Processing completed in {elapsed_time:.2f} seconds")
+    logger.info(f"Processing completed in {elapsed_time:.2f} seconds")
 
-def analyze_features(args):
-    """Analyze precomputed features to gain insights"""
+def analyze_features(args: argparse.Namespace) -> None:
+    """Analyze precomputed features to gain insights
+    
+    Args:
+        args: Command line arguments
+    """
+    import numpy as np
+    
     if not os.path.exists(args.features_path):
-        print(f"Error: Features file not found at {args.features_path}")
+        logger.error(f"Error: Features file not found at {args.features_path}")
         return
     
     # Load features
     features, labels, paths = load_and_verify_features(args.features_path)
     
     if len(features) == 0:
-        print("Error: No valid features found for analysis.")
+        logger.error("Error: No valid features found for analysis.")
         return
     
     if len(labels) == 0:
-        print("Error: No labels found. Feature analysis requires labeled data.")
+        logger.error("Error: No labels found. Feature analysis requires labeled data.")
         return
     
-    print("\nFeature Analysis:")
-    print("================")
+    logger.info("\nFeature Analysis:")
+    logger.info("================")
     
     # Split features by class
     authentic_features = features[labels == 0]
     forged_features = features[labels == 1]
     
-    print(f"Authentic samples: {len(authentic_features)}")
-    print(f"Forged samples: {len(forged_features)}")
+    logger.info(f"Authentic samples: {len(authentic_features)}")
+    logger.info(f"Forged samples: {len(forged_features)}")
     
     # Compute feature statistics by class
     authentic_mean = np.mean(authentic_features, axis=0)
@@ -438,9 +496,9 @@ def analyze_features(args):
     feature_diff = np.abs(authentic_mean - forged_mean)
     top_features = np.argsort(-feature_diff)[:10]  # Top 10 features
     
-    print("\nTop 10 most discriminative features:")
+    logger.info("\nTop 10 most discriminative features:")
     for i, feature_idx in enumerate(top_features):
-        print(f"{i+1}. Feature {feature_idx}: "
+        logger.info(f"{i+1}. Feature {feature_idx}: "
               f"Auth={authentic_mean[feature_idx]:.4f}, "
               f"Forged={forged_mean[feature_idx]:.4f}, "
               f"Diff={feature_diff[feature_idx]:.4f}")
@@ -475,68 +533,42 @@ def analyze_features(args):
     # Save the plot
     analysis_file = os.path.join(args.output_dir, 'feature_analysis.png')
     plt.savefig(analysis_file)
-    print(f"\nFeature analysis plot saved to {analysis_file}")
+    logger.info(f"\nFeature analysis plot saved to {analysis_file}")
     
     # PCA visualization if we have enough samples
     if len(features) > 2:
-        from sklearn.decomposition import PCA
-        from sklearn.preprocessing import StandardScaler
-        
-        # Standardize the features
-        scaler = StandardScaler()
-        features_scaled = scaler.fit_transform(features)
-        
-        # Apply PCA
-        pca = PCA(n_components=2)
-        features_pca = pca.fit_transform(features_scaled)
-        
-        # Plot PCA
-        plt.figure(figsize=(10, 8))
-        plt.scatter(features_pca[labels == 0, 0], features_pca[labels == 0, 1], 
-                    c='blue', marker='o', alpha=0.7, label='Authentic')
-        plt.scatter(features_pca[labels == 1, 0], features_pca[labels == 1, 1], 
-                    c='red', marker='x', alpha=0.7, label='Forged')
-        plt.title('PCA Visualization of Features')
-        plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-        plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        # Save the PCA plot
-        pca_file = os.path.join(args.output_dir, 'pca_visualization.png')
-        plt.savefig(pca_file)
-        print(f"PCA visualization saved to {pca_file}")
-
-def plot_history(history, output_dir):
-    """Plot training history"""
-    plt.figure(figsize=(12, 5))
-    
-    # Plot loss
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_loss'], label='Train')
-    plt.plot(history['val_loss'], label='Validation')
-    plt.title('Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # Plot accuracy
-    plt.subplot(1, 2, 2)
-    plt.plot(history['train_acc'], label='Train')
-    plt.plot(history['val_acc'], label='Validation')
-    plt.title('Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save the plot
-    history_file = os.path.join(output_dir, 'training_history.png')
-    plt.savefig(history_file)
-    print(f"Training history plot saved to {history_file}")
+        try:
+            from sklearn.decomposition import PCA
+            from sklearn.preprocessing import StandardScaler
+            
+            # Standardize the features
+            scaler = StandardScaler()
+            features_scaled = scaler.fit_transform(features)
+            
+            # Apply PCA
+            pca = PCA(n_components=2)
+            features_pca = pca.fit_transform(features_scaled)
+            
+            # Plot PCA
+            plt.figure(figsize=(10, 8))
+            plt.scatter(features_pca[labels == 0, 0], features_pca[labels == 0, 1], 
+                        c='blue', marker='o', alpha=0.7, label='Authentic')
+            plt.scatter(features_pca[labels == 1, 0], features_pca[labels == 1, 1], 
+                        c='red', marker='x', alpha=0.7, label='Forged')
+            plt.title('PCA Visualization of Features')
+            plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+            plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # Save the PCA plot
+            pca_file = os.path.join(args.output_dir, 'pca_visualization.png')
+            plt.savefig(pca_file)
+            logger.info(f"PCA visualization saved to {pca_file}")
+        except ImportError:
+            logger.warning("scikit-learn not installed. Skipping PCA visualization.")
+        except Exception as e:
+            logger.error(f"Error during PCA visualization: {e}", exc_info=args.debug)
 
 if __name__ == "__main__":
     main()
