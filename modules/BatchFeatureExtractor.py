@@ -75,28 +75,29 @@ class OptimizedBatchProcessor:
             'labels': []
         }
         
-        # Process images in batches
-        for batch_idx in range(0, num_images, self.batch_size):
-            batch_end = min(batch_idx + self.batch_size, num_images)
-            batch_files = image_files[batch_idx:batch_end]
-            batch_paths = [os.path.join(directory, f) for f in batch_files]
-            
-            print(f"\nProcessing batch {batch_idx//self.batch_size + 1}/{(num_images-1)//self.batch_size + 1} "
-                 f"({len(batch_files)} images)")
-            
-            # Extract features for batch
-            batch_features = self._process_image_batch(batch_paths)
-            
-            if batch_features is not None:
-                results['paths'].extend(batch_paths)
-                results['features'].append(batch_features.cpu().numpy())
+        # Process images in batches with a progress bar
+        with tqdm(total=num_images, desc="Extracting features", unit="img") as pbar:
+            for batch_idx in range(0, num_images, self.batch_size):
+                batch_end = min(batch_idx + self.batch_size, num_images)
+                batch_files = image_files[batch_idx:batch_end]
+                batch_paths = [os.path.join(directory, f) for f in batch_files]
                 
-                # Add labels if provided
-                if label is not None:
-                    results['labels'].extend([label] * len(batch_paths))
-            
-            # Clean up GPU memory after each batch
-            torch.cuda.empty_cache()
+                # Extract features for batch
+                batch_features = self._process_image_batch(batch_paths)
+                
+                if batch_features is not None:
+                    results['paths'].extend(batch_paths)
+                    results['features'].append(batch_features.cpu().numpy())
+                    
+                    # Add labels if provided
+                    if label is not None:
+                        results['labels'].extend([label] * len(batch_paths))
+                
+                # Update progress bar with the number of successfully processed images
+                pbar.update(len(batch_paths))
+                
+                # Clean up GPU memory after each batch
+                torch.cuda.empty_cache()
         
         # Combine features into a single array
         if results['features']:
@@ -177,7 +178,7 @@ class OptimizedBatchProcessor:
                     ycbcr_dict_batch.append(ycbcr_dict)
                 
                 # Use the BatchFeatureExtractor for efficient feature extraction
-                with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                with torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
                     feature_vectors = self.feature_extractor.extract_batch_features(
                         ycbcr_tensor, pdywt_batch
                     )
@@ -223,7 +224,7 @@ class OptimizedBatchProcessor:
             
             # Make predictions with mixed precision
             with torch.no_grad(), torch.cuda.stream(self.streams['predict']), \
-                 torch.cuda.amp.autocast(enabled=self.use_fp16):
+                 torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
                 confidences = self.model.model(features).squeeze(-1)
             
             # Convert to binary predictions
@@ -270,11 +271,14 @@ class OptimizedBatchProcessor:
             'errors': []
         }
         
-        for i, (path, pred, conf) in enumerate(zip(precomputed['paths'], predictions, confidences)):
-            img_name = os.path.basename(path)
-            result_type = 'forged' if pred == 1 else 'authentic'
-            results[result_type].append(img_name)
-            print(f"Image {img_name}: {result_type.upper()} (Confidence: {conf:.2f})")
+        # Display results with a progress bar
+        with tqdm(total=len(precomputed['paths']), desc="Processing results", unit="img") as pbar:
+            for i, (path, pred, conf) in enumerate(zip(precomputed['paths'], predictions, confidences)):
+                img_name = os.path.basename(path)
+                result_type = 'forged' if pred == 1 else 'authentic'
+                results[result_type].append(img_name)
+                pbar.set_postfix(file=img_name, result=result_type, conf=f"{conf:.2f}")
+                pbar.update(1)
         
         # Print summary
         print("\nProcessing complete!")

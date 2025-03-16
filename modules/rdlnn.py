@@ -6,7 +6,8 @@ from sklearn.preprocessing import StandardScaler
 import numpy as np
 import os
 import gc
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
+import time
 
 class RegressionDLNN(nn.Module):
     """
@@ -23,55 +24,31 @@ class RegressionDLNN(nn.Module):
         """
         super(RegressionDLNN, self).__init__()
         
-        # Ensure CUDA is available
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available. This implementation requires a CUDA-capable GPU.")
+        # Check if CUDA is available
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Set device to CUDA with specific device selection
-        self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        
-        # Define the model architecture with optimized layer sizes and batch normalization
+        # Define the model architecture with stronger regularization
         self.model = nn.Sequential(
             # Input layer
-            nn.Linear(input_dim, 128),
-            nn.BatchNorm1d(128),  # Add batch normalization
+            nn.Linear(input_dim, 8),  # Reduced from 64 to 8
+            nn.BatchNorm1d(8),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.9),  # Increased from 0.4 to 0.8
             
-            # Hidden layers with batch normalization
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            
-            nn.Linear(64, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            
-            # Output layer with sigmoid activation for binary classification
-            nn.Linear(32, 1),
+            # Output layer - removed middle layer
+            nn.Linear(8, 1),
             nn.Sigmoid()
         ).to(self.device)
         
         # Initialize weights using Kaiming initialization
         self._init_weights()
         
-        # Define loss function and optimizer with weight decay
+        # Define loss function
         self.loss_fn = nn.BCELoss()
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=0.001,
-            weight_decay=1e-5  # L2 regularization
-        )
         
-        # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=5,
-            verbose=True
-        )
+        # Will initialize optimizer in fit method with stronger weight decay
+        self.optimizer = None
+        self.scheduler = None
         
         # For feature normalization
         self.scaler = StandardScaler()
@@ -79,10 +56,13 @@ class RegressionDLNN(nn.Module):
         # Initialize gradient scaler for mixed precision training
         self.scaler_amp = GradScaler()
         
-        # Print CUDA information
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        print(f"CUDA Version: {torch.version.cuda}")
+        # Print device information
+        if torch.cuda.is_available():
+            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+            print(f"CUDA Version: {torch.version.cuda}")
+        else:
+            print("Using CPU for computation")
         
     def _init_weights(self):
         """Initialize weights using Kaiming initialization"""
@@ -96,30 +76,57 @@ class RegressionDLNN(nn.Module):
         """Forward pass through the network"""
         return self.model(x)
     
-    def train_model(self, X, y, validation_split=0.2, epochs=50, batch_size=32, early_stopping=10):
+    def fit(self, X, y, epochs=50, learning_rate=0.001, batch_size=32, validation_split=0.3, early_stopping=3, use_fp16=False):
         """
         Train the RDLNN model with optimized training loop
         
         Args:
             X: Feature vectors
             y: Labels (0: authentic, 1: forged)
-            validation_split: Fraction of data to use for validation
             epochs: Number of training epochs
+            learning_rate: Learning rate for training
             batch_size: Batch size for training
+            validation_split: Fraction of data to use for validation
             early_stopping: Number of epochs with no improvement after which training will stop
+            use_fp16: Whether to use half precision (FP16) operations
             
         Returns:
             Training history (dictionary with loss and accuracy metrics)
         """
-        # Set appropriate CUDA device
-        torch.cuda.set_device(0)
+        # Initialize optimizer and scheduler with the given learning rate
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=1e-2  # Increased from 5e-3
+        )
         
-        # Normalize features
-        X_scaled = self.scaler.fit_transform(X)
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            factor=0.5,
+            patience=5,
+        )
         
-        # Convert to PyTorch tensors directly on CUDA
-        X_tensor = torch.tensor(X_scaled, dtype=torch.float32, device=self.device)
-        y_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).reshape(-1, 1)
+        # If CUDA is available and using it
+        if torch.cuda.is_available() and self.device.type == 'cuda':
+            # Set appropriate CUDA device
+            if self.device.type == 'cuda' and hasattr(self.device, 'index') and self.device.index is not None:
+                torch.cuda.set_device(self.device.index)
+        
+        # Normalize features if X is a numpy array
+        if isinstance(X, np.ndarray):
+            X_scaled = self.scaler.fit_transform(X)
+            X_tensor = torch.tensor(X_scaled, dtype=torch.float32, device=self.device)
+            y_tensor = torch.tensor(y, dtype=torch.float32, device=self.device)
+        else:
+            # Assume they're already torch tensors
+            X_tensor = X
+            y_tensor = y
+            
+        # Ensure y is 2D
+        if y_tensor.dim() == 1:
+            y_tensor = y_tensor.reshape(-1, 1)
         
         # Create dataset
         dataset = TensorDataset(X_tensor, y_tensor)
@@ -135,24 +142,25 @@ class RegressionDLNN(nn.Module):
         # Calculate optimal number of workers based on system
         num_workers = min(4, os.cpu_count() or 4)
         
-        # Create data loaders with CUDA optimizations
+        # Create data loaders with device optimizations
+        # Create data loaders with device optimizations
         train_loader = DataLoader(
             train_dataset, 
             batch_size=batch_size, 
             shuffle=True,
-            pin_memory=True,
+            pin_memory=False,  # Change this from True or from device.type=='cuda'
             num_workers=num_workers,
-            persistent_workers=True,
-            prefetch_factor=2  # Prefetch 2 batches per worker
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None
         )
-        
+
         val_loader = DataLoader(
             val_dataset, 
-            batch_size=batch_size * 2,  # Larger batch size for validation
-            pin_memory=True,
+            batch_size=batch_size * 2,
+            pin_memory=False,  # Change this from True or from device.type=='cuda'
             num_workers=num_workers,
-            persistent_workers=True,
-            prefetch_factor=2
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None
         )
         
         # Set model to training mode
@@ -167,60 +175,96 @@ class RegressionDLNN(nn.Module):
         }
         
         # CUDA events for timing and synchronization
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        # Training loop with CUDA benchmarking and mixed precision
-        torch.backends.cudnn.benchmark = True
+        if self.device.type == 'cuda':
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            torch.backends.cudnn.benchmark = True  # Optimize for fixed input sizes
+            stream1 = torch.cuda.Stream()
+            stream2 = torch.cuda.Stream()
         
         # Early stopping setup
         best_val_loss = float('inf')
         best_model_state = None
         early_stopping_counter = 0
         
-        # Create CUDA streams for parallelize data transfers and computations
-        stream1 = torch.cuda.Stream()
-        stream2 = torch.cuda.Stream()
-        
         # Preallocate tensors for metrics to avoid recreating them
         train_loss_tensor = torch.zeros(1, device=self.device)
         val_loss_tensor = torch.zeros(1, device=self.device)
         
         for epoch in range(epochs):
-            start_event.record()
+            if self.device.type == 'cuda':
+                start_event.record()
+            else:
+                start_time = time.time()
             
             # Training metrics
             train_loss = 0.0
             train_correct = 0
             train_samples = 0
             
-            # Training loop with mixed precision
+            # Training loop with mixed precision if requested
             for inputs, targets in train_loader:
                 # Zero the gradients
                 self.optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
                 
-                # Using mixed precision for forward and backward pass
-                with autocast(device_type='cuda', dtype=torch.float16):
-                    # Forward pass
-                    outputs = self.model(inputs)
+                # Forward and backward pass
+                if use_fp16 and self.device.type == 'cuda':
+                    # Using mixed precision
+                    with autocast(device_type='cuda', dtype=torch.float16):
+                        # Add noise during training for regularization
+                        if self.training:
+                            noise = torch.randn_like(inputs) * 0.05  # 5% noise
+                            noisy_inputs = inputs + noise
+                            outputs = self.model(noisy_inputs)
+                        else:
+                            outputs = self.model(inputs)
+                        loss = self.loss_fn(outputs, targets)
                     
-                    # Calculate loss
+                    # Scale loss and do backward pass
+                    self.scaler_amp.scale(loss).backward()
+                    
+                    # Update weights with gradient scaling
+                    self.scaler_amp.step(self.optimizer)
+                    self.scaler_amp.update()
+                else:
+                    # Standard precision
+                    # Add noise during training for regularization
+                    if self.training:
+                        noise = torch.randn_like(inputs) * 0.05  # 5% noise
+                        noisy_inputs = inputs + noise
+                        outputs = self.model(noisy_inputs)
+                    else:
+                        outputs = self.model(inputs)
                     loss = self.loss_fn(outputs, targets)
+                    loss.backward()
+                    self.optimizer.step()
                 
-                # Scale loss and do backward pass
-                self.scaler_amp.scale(loss).backward()
-                
-                # Update weights with gradient scaling
-                self.scaler_amp.step(self.optimizer)
-                self.scaler_amp.update()
-                
-                # Track metrics - use different stream to avoid blocking computation
-                with torch.cuda.stream(stream1):
-                    train_loss_tensor.copy_(loss)
-                    train_loss += train_loss_tensor.item() * inputs.size(0)
+                # Track metrics
+                if self.device.type == 'cuda':
+                    with torch.cuda.stream(stream1):
+                        train_loss_tensor.copy_(loss)
+                        train_loss += train_loss_tensor.item() * inputs.size(0)
+                        predicted = (outputs >= 0.5).float()
+                        train_correct += (predicted == targets).sum().item()
+                        train_samples += inputs.size(0)
+                else:
+                    train_loss += loss.item() * inputs.size(0)
                     predicted = (outputs >= 0.5).float()
                     train_correct += (predicted == targets).sum().item()
                     train_samples += inputs.size(0)
+
+                # Calculate the regular BCE loss
+                outputs = self.model(inputs)  # or noisy_inputs if you're using noise
+                bce_loss = self.loss_fn(outputs, targets)
+
+                # Add L1 regularization
+                l1_lambda = 0.01  # Adjust this value as needed
+                l1_reg = 0
+                for param in self.model.parameters():
+                    l1_reg += torch.norm(param, 1)
+
+                # Combined loss
+                loss = bce_loss + l1_lambda * l1_reg
             
             # Calculate epoch metrics
             avg_train_loss = train_loss / train_samples
@@ -232,18 +276,32 @@ class RegressionDLNN(nn.Module):
             val_correct = 0
             val_samples = 0
             
-            with torch.no_grad(), torch.cuda.stream(stream2):
-                for inputs, targets in val_loader:
-                    # Use mixed precision for inference
-                    with autocast(device_type='cuda', dtype=torch.float16):
+            with torch.no_grad():
+                if self.device.type == 'cuda':
+                    with torch.cuda.stream(stream2):
+                        for inputs, targets in val_loader:
+                            if use_fp16:
+                                with autocast(device_type='cuda', dtype=torch.float16):
+                                    outputs = self.model(inputs)
+                                    loss = self.loss_fn(outputs, targets)
+                            else:
+                                outputs = self.model(inputs)
+                                loss = self.loss_fn(outputs, targets)
+                            
+                            val_loss_tensor.copy_(loss)
+                            val_loss += val_loss_tensor.item() * inputs.size(0)
+                            predicted = (outputs >= 0.5).float()
+                            val_correct += (predicted == targets).sum().item()
+                            val_samples += inputs.size(0)
+                else:
+                    for inputs, targets in val_loader:
                         outputs = self.model(inputs)
                         loss = self.loss_fn(outputs, targets)
-                    
-                    val_loss_tensor.copy_(loss)
-                    val_loss += val_loss_tensor.item() * inputs.size(0)
-                    predicted = (outputs >= 0.5).float()
-                    val_correct += (predicted == targets).sum().item()
-                    val_samples += inputs.size(0)
+                        
+                        val_loss += loss.item() * inputs.size(0)
+                        predicted = (outputs >= 0.5).float()
+                        val_correct += (predicted == targets).sum().item()
+                        val_samples += inputs.size(0)
             
             # Calculate validation metrics
             avg_val_loss = val_loss / val_samples
@@ -275,12 +333,16 @@ class RegressionDLNN(nn.Module):
             history['val_loss'].append(avg_val_loss)
             history['val_acc'].append(val_accuracy)
             
-            # End timing and synchronize CUDA streams
-            stream1.synchronize()
-            stream2.synchronize()
-            end_event.record()
-            torch.cuda.synchronize()
-            epoch_time = start_event.elapsed_time(end_event) / 1000  # Convert to seconds
+            # End timing and calculate epoch time
+            if self.device.type == 'cuda':
+                # End timing and synchronize CUDA streams
+                stream1.synchronize()
+                stream2.synchronize()
+                end_event.record()
+                torch.cuda.synchronize()
+                epoch_time = start_event.elapsed_time(end_event) / 1000  # Convert to seconds
+            else:
+                epoch_time = time.time() - start_time
             
             # Print progress with timing info
             print(f"Epoch {epoch+1}/{epochs} - "
@@ -289,13 +351,15 @@ class RegressionDLNN(nn.Module):
                   f"val_loss: {avg_val_loss:.4f} - val_acc: {val_accuracy:.4f}")
             
             # Periodically clear CUDA cache
-            if epoch % 5 == 0:
+            if self.device.type == 'cuda' and epoch % 5 == 0:
                 torch.cuda.empty_cache()
                 gc.collect()
         
         # Final cleanup
         del best_model_state
-        torch.cuda.empty_cache()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         gc.collect()
         
         return history
@@ -305,61 +369,97 @@ class RegressionDLNN(nn.Module):
         Predict if an image is forged (1) or authentic (0) using optimized inference
         
         Args:
-            X: Feature vector
+            X: Feature vector or batch of feature vectors
             
         Returns:
-            Prediction (0: authentic, 1: forged) and confidence level (0-1)
+            Tuple of (predictions, confidences)
         """
         # Check if scaler is fitted
         if not hasattr(self.scaler, 'mean_') or self.scaler.mean_ is None:
             print("Warning: StandardScaler not fitted yet. Please train the model first.")
-            return 0, 0.5  # Default prediction
+            return np.zeros(X.shape[0] if X.ndim > 1 else 1), np.full(X.shape[0] if X.ndim > 1 else 1, 0.5)
         
         try:
             # Set model to evaluation mode
             self.model.eval()
             
+            # Handle single feature vector or batch
+            if X.ndim == 1:
+                X = X.reshape(1, -1)
+            
             # Normalize features
-            X_scaled = self.scaler.transform(X.reshape(1, -1))
+            X_scaled = self.scaler.transform(X)
             
             # Convert to tensor and move to device
             X_tensor = torch.tensor(X_scaled, dtype=torch.float32, device=self.device)
             
-            # Make prediction with mixed precision
-            with torch.no_grad(), autocast(device_type='cuda', dtype=torch.float16):
-                confidence = self.model(X_tensor).item()
+            # Make prediction
+            with torch.no_grad():
+                confidences = self.model(X_tensor).cpu().numpy()
             
             # Convert to binary output with confidence
-            prediction = 1 if confidence >= 0.5 else 0
+            predictions = (confidences >= 0.5).astype(int)
             
-            # Return confidence level appropriate for the prediction
-            return prediction, confidence if prediction == 1 else (1 - confidence)
+            # Return predictions and confidences
+            return predictions.flatten(), confidences.flatten()
         except Exception as e:
             print(f"Error during prediction: {e}")
-            return 0, 0.5  # Default prediction in case of error
+            # Return default predictions in case of error
+            return np.zeros(X.shape[0]), np.full(X.shape[0], 0.5)
     
-    def save_model(self, filepath):
+    def save(self, filepath):
         """Save the model to disk with optimized format"""
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # Synchronize CUDA operations before moving data
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()
+            
+            # Move model to CPU for saving to avoid GPU memory issues
+            cpu_model = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+            
+            # Make sure optimizer state is also moved to CPU
+            optimizer_state = None
+            if self.optimizer:
+                optimizer_state = {
+                    k: v.cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in self.optimizer.state_dict().items()
+                }
+            
+            # Save model state, optimizer state, and scaler
+            torch.save({
+                'model_state_dict': cpu_model,
+                'optimizer_state_dict': optimizer_state,
+                'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+                'scaler': self.scaler,
+                'input_dim': self.model[0].in_features,  # Store input dimension for loading
+                'architecture': 'rdlnn_v1'  # Version tag
+            }, filepath)
+            
+            print(f"Model saved to {filepath}")
+        except Exception as e:
+            print(f"Error saving model: {e}")
+        finally:
+            # Ensure proper cleanup
+            if 'cpu_model' in locals():
+                del cpu_model
+            if 'optimizer_state' in locals():
+                del optimizer_state
+            # Synchronize before leaving the function
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()
+
+    def load(cls, filepath):
+        """Load a trained model from disk
         
-        # Move model to CPU for saving to avoid GPU memory issues
-        cpu_model = {k: v.cpu() for k, v in self.model.state_dict().items()}
-        
-        # Save model state, optimizer state, and scaler
-        torch.save({
-            'model_state_dict': cpu_model,
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'scaler': self.scaler,
-            'input_dim': self.model[0].in_features,  # Store input dimension for loading
-            'architecture': 'rdlnn_v2'  # Version tag
-        }, filepath)
-        
-        print(f"Model saved to {filepath}")
-    
-    def load_model(self, filepath):
-        """Load a trained model from disk with optimized loading"""
+        Args:
+            filepath: Path to saved model file
+            
+        Returns:
+            Loaded RegressionDLNN model
+        """
         try:
             # Load checkpoint with CPU mapping first to avoid OOM
             checkpoint = torch.load(filepath, map_location='cpu')
@@ -368,61 +468,44 @@ class RegressionDLNN(nn.Module):
             architecture = checkpoint.get('architecture', 'rdlnn_v1')
             print(f"Loading model architecture: {architecture}")
             
-            # Check if the model architecture matches
+            # Get input dimension from checkpoint
             input_dim = checkpoint.get('input_dim')
-            if input_dim and input_dim != self.model[0].in_features:
-                print(f"Rebuilding model with input dimension {input_dim}")
-                # Rebuild model with correct dimensions and batch normalization
-                self.model = nn.Sequential(
-                    nn.Linear(input_dim, 128),
-                    nn.BatchNorm1d(128),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(128, 64),
-                    nn.BatchNorm1d(64),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(64, 32),
-                    nn.BatchNorm1d(32),
-                    nn.ReLU(),
-                    nn.Linear(32, 1),
-                    nn.Sigmoid()
-                ).to(self.device)
+            if not input_dim:
+                raise ValueError("Input dimension not found in checkpoint")
+                
+            # Create new model instance
+            model = cls(input_dim)
             
             # Load model state
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            model.model.load_state_dict(checkpoint['model_state_dict'])
 
-            # Load optimizer state - use AdamW to match the save operation
-            self.optimizer = optim.AdamW(
-                self.model.parameters(),
-                lr=0.001,
-                weight_decay=1e-5
-            )
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # Load optimizer state if present
+            if checkpoint['optimizer_state_dict'] is not None:
+                model.optimizer = optim.AdamW(
+                    model.model.parameters(),
+                    lr=0.001,
+                    weight_decay=1e-5
+                )
+                model.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
             # Restore scheduler state if it exists
-            if 'scheduler_state_dict' in checkpoint:
-                self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                    self.optimizer,
+            if checkpoint.get('scheduler_state_dict') is not None:
+                model.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    model.optimizer,
                     mode='min',
                     factor=0.5,
-                    patience=5,
-                    verbose=True
+                    patience=5
                 )
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                model.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
             # Load scaler
-            self.scaler = checkpoint['scaler']
+            model.scaler = checkpoint['scaler']
 
             # Move model to the correct device after loading
-            self.model = self.model.to(self.device)
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if torch.is_tensor(v):
-                        state[k] = v.to(self.device)
-
+            model.model = model.model.to(model.device)
+            
             print(f"Model loaded successfully from {filepath}")
-            return True
+            return model
         except Exception as e:
             print(f"Error loading model: {e}")
-            return False
+            return None

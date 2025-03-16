@@ -104,7 +104,7 @@ class BatchFeatureExtractor:
         
         # Add automatic mixed precision
         dtype = torch.float16 if self.use_fp16 else torch.float32
-        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+        with torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
             # Apply Sobel filters to get gradients
             grad_x = F.conv2d(y_batch, self.sobel_x, padding=1)
             grad_y = F.conv2d(y_batch, self.sobel_y, padding=1)
@@ -155,7 +155,7 @@ class BatchFeatureExtractor:
         """
         batch_size = ycbcr_batch.shape[0]
         
-        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+        with torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
             # 1. Channel correlations
             # Reshape and compute correlations
             b, c, h, w = ycbcr_batch.shape
@@ -230,7 +230,7 @@ class BatchFeatureExtractor:
         """
         batch_size = len(wavelet_coeffs_batch)
         
-        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+        with torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
             # Preallocate tensor for wavelet features
             # We'll extract variance and energy from each subband
             feature_dim = 12  # 3 channels x 4 subbands (LL, LH, HL, HH)

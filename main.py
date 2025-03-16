@@ -4,10 +4,25 @@ import torch
 import numpy as np
 import time
 from pathlib import Path
+import gc
 
 from modules.BatchFeatureExtractor import OptimizedBatchProcessor
-from modules.models import RegressionDLNN
+from modules.rdlnn import RegressionDLNN
 from modules.preprocessing import preprocess_image
+
+import signal
+import sys
+
+def signal_handler(sig, frame):
+    print('Cleaning up resources before exit...')
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
 
 def main():
     parser = argparse.ArgumentParser(description='Image Forgery Detection System')
@@ -130,26 +145,64 @@ def train_model(args):
     data = np.load(args.features_path)
     features = data['features']
     labels = data['labels']
+    paths = data['paths']
+
+    # Filter to keep only samples with valid features and labels
+    valid_indices = []
+    for i in range(len(labels)):
+        # Check if both feature and label exist and are valid
+        if i < len(features) and not np.isnan(features[i]).any() and i < len(labels) and not np.isnan(labels[i]):
+            valid_indices.append(i)
+
+    # Apply filtering
+    filtered_features = features[valid_indices]
+    filtered_labels = np.array(labels)[valid_indices]
+    filtered_paths = [paths[i] for i in valid_indices]
+
+    print(f"Original dataset size: {len(features)} samples")
+    print(f"Filtered dataset size: {len(filtered_features)} samples")
+
+    # Update the references for further processing
+    features = filtered_features
+    labels = filtered_labels
     
-    # Convert to torch tensors
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    X = torch.tensor(features, dtype=torch.float32, device=device)
-    y = torch.tensor(labels, dtype=torch.float32, device=device).unsqueeze(1)
-    
-    # Create and train the model
-    input_dim = features.shape[1]
-    model = RegressionDLNN(input_dim)
-    model.fit(
-        X, y, 
-        epochs=args.epochs, 
-        learning_rate=args.learning_rate,
-        batch_size=args.batch_size,
-        use_fp16=args.fp16
-    )
-    
-    # Save the model
-    model.save(args.model_path)
-    print(f"Model saved to {args.model_path}")
+    try:
+        # Convert to torch tensors
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        X = torch.tensor(features, dtype=torch.float32, device=device)
+        y = torch.tensor(labels, dtype=torch.float32, device=device).unsqueeze(1)
+        
+        # Create and train the model
+        input_dim = features.shape[1]
+        model = RegressionDLNN(input_dim)
+        model.fit(
+            X, y, 
+            epochs=args.epochs, 
+            learning_rate=args.learning_rate,
+            batch_size=args.batch_size,
+            validation_split=0.4,  # Increased from 0.2
+            early_stopping=3,  # Reduced from 10
+            use_fp16=args.fp16
+        )
+        
+        # Save the model
+        model.save(args.model_path)
+        print(f"Model saved to {args.model_path}")
+    finally:
+        # Ensure cleanup of CUDA resources
+        if torch.cuda.is_available():
+            # Delete tensors explicitly
+            if 'X' in locals():
+                del X
+            if 'y' in locals():
+                del y
+            if 'model' in locals():
+                del model
+            # Clear CUDA cache and wait for all operations to complete
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        # Force garbage collection
+        gc.collect()
 
 def test_model(args):
     """Test the model on images in the input directory"""
