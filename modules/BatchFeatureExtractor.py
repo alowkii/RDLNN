@@ -5,7 +5,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import gc
 from modules.preprocessing import preprocess_image
-from modules.imageDecomposition import polar_dyadic_wavelet_transform
+from modules.image_decomposition import polar_dyadic_wavelet_transform
 from modules.featureExtraction import BatchFeatureExtractor
 
 class OptimizedBatchProcessor:

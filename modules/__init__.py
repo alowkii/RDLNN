@@ -4,7 +4,7 @@
 from .rdlnn import RegressionDLNN
 from .data_handling import precompute_features, load_and_verify_features
 from .preprocessing import preprocess_image
-from .imageDecomposition import polar_dyadic_wavelet_transform
+from .image_decomposition import polar_dyadic_wavelet_transform
 from .featureExtraction import BatchFeatureExtractor
 from .BatchFeatureExtractor import OptimizedBatchProcessor
 

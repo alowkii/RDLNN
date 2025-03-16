@@ -1,14 +1,20 @@
-import numpy as np
-import pywt
+"""
+Wavelet transform functions for image decomposition
+"""
+
 import torch
 import torch.nn.functional as F
+from typing import Tuple, Dict, Optional
+from modules.utils import logger
 
-def polar_dyadic_wavelet_transform(ycbcr_img):
+def perform_wavelet_transform(ycbcr_img: torch.Tensor, 
+                              use_polar: bool = True) -> Optional[Dict[str, Tuple]]:
     """
-    Implement GPU-accelerated Polar Dyadic Wavelet Transform (PDyWT) using PyTorch
+    Apply wavelet transform to a YCbCr image
     
     Args:
         ycbcr_img: YCbCr preprocessed image as torch.Tensor [C, H, W]
+        use_polar: Whether to apply polar transformation to coefficients
         
     Returns:
         Dictionary with decomposed wavelet coefficients for all channels
@@ -53,25 +59,30 @@ def polar_dyadic_wavelet_transform(ycbcr_img):
         coeffs_cb = _torch_swt2(cb_channel, device)
         coeffs_cr = _torch_swt2(cr_channel, device)
         
-        # Apply polar transformation
-        polar_coeffs_y = _transform_to_polar(coeffs_y)
-        polar_coeffs_cb = _transform_to_polar(coeffs_cb)
-        polar_coeffs_cr = _transform_to_polar(coeffs_cr)
+        # Apply polar transformation if requested
+        if use_polar:
+            result_y = _transform_to_polar(coeffs_y)
+            result_cb = _transform_to_polar(coeffs_cb)
+            result_cr = _transform_to_polar(coeffs_cr)
+        else:
+            result_y = coeffs_y
+            result_cb = coeffs_cb
+            result_cr = coeffs_cr
         
         # Return dictionary with coefficients
         return {
-            'y': polar_coeffs_y,
-            'cb': polar_coeffs_cb,
-            'cr': polar_coeffs_cr
+            'y': result_y,
+            'cb': result_cb,
+            'cr': result_cr
         }
     
     except Exception as e:
-        print(f"Error in polar dyadic wavelet transform: {e}")
-        raise e
+        logger.error(f"Error in wavelet transform: {e}")
+        return None
 
-def _torch_swt2(data, device):
+def _torch_swt2(data: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    PyTorch implementation of stationary wavelet transform
+    PyTorch implementation of stationary wavelet transform (SWT)
     
     Args:
         data: 2D PyTorch tensor
@@ -118,9 +129,9 @@ def _torch_swt2(data, device):
     
     return ll, lh, hl, hh
 
-def _transform_to_polar(coeffs):
+def _transform_to_polar(coeffs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Transform wavelet coefficients to polar coordinates using PyTorch
+    Transform wavelet coefficients to polar coordinates
     
     Args:
         coeffs: Tuple of (LL, LH, HL, HH) wavelet coefficients
@@ -161,3 +172,23 @@ def _transform_to_polar(coeffs):
     polar_hh = hh * r_norm
     
     return polar_ll, polar_lh, polar_hl, polar_hh
+
+def get_wavelet_coeffs_from_batch(ycbcr_batch: torch.Tensor) -> list:
+    """
+    Apply wavelet transform to each image in a batch
+    
+    Args:
+        ycbcr_batch: Batch of YCbCr images [B, C, H, W]
+        
+    Returns:
+        List of wavelet coefficients dictionaries
+    """
+    batch_size = ycbcr_batch.shape[0]
+    pdywt_batch = []
+    
+    for i in range(batch_size):
+        coeffs = perform_wavelet_transform(ycbcr_batch[i])
+        if coeffs is not None:
+            pdywt_batch.append(coeffs)
+    
+    return pdywt_batch

@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from concurrent.futures import ThreadPoolExecutor
 from modules.preprocessing import preprocess_image
-from modules.imageDecomposition import polar_dyadic_wavelet_transform
+from modules.image_decomposition import polar_dyadic_wavelet_transform
 from modules.featureExtraction import BatchFeatureExtractor
 from tqdm import tqdm
 
