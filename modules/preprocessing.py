@@ -25,8 +25,7 @@ def preprocess_image(image_path):
 
         # Rearrange back to [C, H, W] format
         ycbcr_tensor = ycbcr_tensor.permute(2, 0, 1)
-
-        print(f"Image converted to YCbCr with shape: {ycbcr_tensor.shape}")
+        
         return ycbcr_tensor
 
     except Exception as e:

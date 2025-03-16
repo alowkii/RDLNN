@@ -23,11 +23,6 @@ def extract_features(polar_coeffs, ycbcr_img):
     device = torch.device("cuda")
     features = []
     
-    # Debug info
-    print(f"Type of ycbcr_img: {type(ycbcr_img)}")
-    if isinstance(ycbcr_img, dict):
-        print(f"Keys in ycbcr_img: {list(ycbcr_img.keys())}")
-    
     # Extract Y, Cb, Cr channels from dictionary with lowercase keys
     if isinstance(ycbcr_img, dict):
         if 'y' in ycbcr_img and 'cb' in ycbcr_img and 'cr' in ycbcr_img:
@@ -49,8 +44,6 @@ def extract_features(polar_coeffs, ycbcr_img):
             raise ValueError(f"Dict doesn't contain expected keys. Available keys: {list(ycbcr_img.keys())}")
     else:
         raise TypeError(f"Expected dict for ycbcr_img, got {type(ycbcr_img)}")
-    
-    print(f"Using Y channel with shape: {y_channel.shape}")
     
     # 1. SURF-like features using PyTorch equivalent operations
     y_channel_2d = y_channel.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
@@ -193,38 +186,27 @@ def extract_features(polar_coeffs, ycbcr_img):
     features.extend(homogeneity_features)
     
     # 6. Variance features from wavelet coefficients
-    print(f"Type of polar_coeffs: {type(polar_coeffs)}")
     if isinstance(polar_coeffs, dict):
-        print(f"Keys in polar_coeffs: {list(polar_coeffs.keys())}")
         
         # Safer processing of wavelet coefficients
-        for channel_name, coeffs in polar_coeffs.items():
-            print(f"Processing coefficients for channel: {channel_name}")
-            print(f"Type of coeffs: {type(coeffs)}")
-            
+        for channel_name, coeffs in polar_coeffs.items():            
             try:
                 # Check what structure coeffs has
                 if isinstance(coeffs, tuple):
-                    print(f"Coeffs is a tuple of length {len(coeffs)}")
                     if len(coeffs) == 2:
                         ll, others = coeffs
-                        print(f"Type of ll: {type(ll)}, Type of others: {type(others)}")
                         
                         # Try different approaches to get the detail coefficients
                         if isinstance(others, tuple):
-                            print(f"Others is a tuple of length {len(others)}")
                             if len(others) == 3:
                                 lh, hl, hh = others
                             else:
-                                print(f"Unexpected length of 'others' tuple: {len(others)}")
                                 # Try to access by index anyway
                                 lh, hl, hh = others[0], others[1], others[2]
                         elif hasattr(others, '__getitem__'):
                             # If it's list-like but not a tuple
-                            print(f"Using __getitem__ to access detail coefficients")
                             lh, hl, hh = others[0], others[1], others[2]
                         else:
-                            print(f"Cannot extract detail coefficients from: {type(others)}")
                             # Use zeros as placeholders
                             if isinstance(ll, torch.Tensor):
                                 shape = ll.shape
@@ -235,34 +217,25 @@ def extract_features(polar_coeffs, ycbcr_img):
                                 # If ll is not a tensor, just use scalar zeros
                                 lh, hl, hh = 0, 0, 0
                     else:
-                        print(f"Unexpected tuple length: {len(coeffs)}")
                         # Try to extract directly if possible
                         if len(coeffs) >= 4:
                             ll, lh, hl, hh = coeffs[0], coeffs[1], coeffs[2], coeffs[3]
                         else:
                             raise ValueError(f"Cannot extract coefficients from tuple of length {len(coeffs)}")
                 else:
-                    print(f"Coeffs is not a tuple but a {type(coeffs)}")
                     # Try to see if it's a list or similar
                     if hasattr(coeffs, '__getitem__') and hasattr(coeffs, '__len__'):
-                        print(f"Trying to treat coeffs as a sequence of length {len(coeffs)}")
                         ll = coeffs[0]
-                        # Check what the structure of ll is
-                        if hasattr(ll, 'shape'):
-                            print(f"Shape of ll: {ll.shape}")
                         # Try to get the other coefficients
                         if len(coeffs) >= 4:
                             lh, hl, hh = coeffs[1], coeffs[2], coeffs[3]
                         else:
-                            print(f"Not enough items in coeffs: {len(coeffs)}")
                             raise ValueError("Cannot extract all required coefficients")
                     else:
-                        print(f"Cannot determine the structure of coeffs")
                         raise ValueError("Unsupported coefficient structure")
                     
                 # Convert to PyTorch tensors directly on GPU
                 if not isinstance(ll, torch.Tensor):
-                    print(f"Converting coefficients to tensors")
                     ll_t = torch.tensor(ll, dtype=torch.float32, device=device)
                     lh_t = torch.tensor(lh, dtype=torch.float32, device=device)
                     hl_t = torch.tensor(hl, dtype=torch.float32, device=device)
@@ -282,16 +255,34 @@ def extract_features(polar_coeffs, ycbcr_img):
                 ]
                 features.extend(var_features)
                 
-                print(f"Successfully processed wavelet coefficients for {channel_name}")
             except Exception as e:
-                print(f"Error processing coefficients for {channel_name}: {e}")
                 # Add zeros as fallback - as GPU tensors
                 features.extend([torch.zeros(1, device=device) for _ in range(4)])
     else:
         print(f"polar_coeffs is not a dictionary but a {type(polar_coeffs)}")
         # Skip wavelet coefficient processing if structure is unknown
     
-    # Concatenate all feature tensors into one
-    feature_vector = torch.cat([f.flatten() for f in features])
-    print(f"Extracted feature vector with {feature_vector.size(0)} features")
-    return feature_vector
+    # Process features to ensure they're all flat tensors
+    processed_features = []
+    for f in features:
+        if isinstance(f, torch.Tensor):
+            # Make sure tensor is 1D by flattening if needed
+            flat_tensor = f.flatten()
+            # Convert to CPU and then to numpy
+            processed_features.append(flat_tensor.cpu().numpy())
+        elif isinstance(f, list):
+            # If it's a list of tensors, process each tensor
+            for item in f:
+                if isinstance(item, torch.Tensor):
+                    processed_features.append(item.cpu().numpy())
+                else:
+                    processed_features.append(np.array([item]))
+        else:
+            # Handle non-tensor types
+            processed_features.append(np.array([f]))
+    
+    # Concatenate all numpy arrays into one feature vector
+    feature_vector = np.concatenate([f.flatten() for f in processed_features])
+    
+    # Return as a row vector
+    return feature_vector.reshape(1, -1)

@@ -22,8 +22,6 @@ def polar_dyadic_wavelet_transform(ycbcr_img):
         if not cp.cuda.is_available():
             raise RuntimeError("CUDA GPU not available")
         
-        print(f"CUDA GPU available: {cp.cuda.is_available()}")
-        
         # Convert input to numpy if it's a torch tensor
         if isinstance(ycbcr_img, torch.Tensor):
             # Move tensor to CPU and convert to numpy
@@ -53,7 +51,6 @@ def polar_dyadic_wavelet_transform(ycbcr_img):
         cr_channel_gpu = cp.pad(cr_channel_gpu, ((0, (h % 2) + 2), (0, (w % 2) + 2)), 'reflect')
         
         new_h, new_w = y_channel_gpu.shape
-        print(f"Padded image to dimensions: {new_h}x{new_w}")
         
         # Calculate appropriate wavelet decomposition level based on image size
         max_level = min(pywt.dwt_max_level(min(y_channel_gpu.shape), pywt.Wavelet('db1').dec_len), 4)
@@ -112,7 +109,6 @@ def polar_dyadic_wavelet_transform(ycbcr_img):
             'cr': (polar_ll_cr, (polar_lh_cr, polar_hl_cr, polar_hh_cr))
         }
         
-        print("PDyWT decomposition completed successfully")
         return polar_coeffs
         
     except Exception as e:
