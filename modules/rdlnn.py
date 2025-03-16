@@ -34,24 +34,23 @@ class RegressionDLNN:
             nn.Linear(input_dim, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(0.3),  # Reduced dropout
+            nn.Dropout(0.3),
             
             # Hidden layer
             nn.Linear(64, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Dropout(0.3),  # Reduced dropout
+            nn.Dropout(0.3),
             
-            # Output layer
-            nn.Linear(32, 1),
-            nn.Sigmoid()
+            # Output layer - remove sigmoid activation
+            nn.Linear(32, 1)
         ).to(self.device)
         
         # Initialize weights using Xavier initialization
         self._init_weights()
         
         # Define loss function
-        self.loss_fn = nn.BCELoss()
+        self.loss_fn = nn.BCEWithLogitsLoss()
         
         # For feature normalization
         self.scaler = StandardScaler()
@@ -211,7 +210,7 @@ class RegressionDLNN:
                 
                 # Track metrics
                 train_loss += loss.item() * inputs.size(0)
-                predicted = (outputs >= 0.5).float()
+                predicted = (torch.sigmoid(outputs) >= 0.5).float()
                 train_correct += (predicted == targets).sum().item()
                 train_samples += inputs.size(0)
             
@@ -239,7 +238,7 @@ class RegressionDLNN:
                         loss = self.loss_fn(outputs, targets)
                     
                     val_loss += loss.item() * inputs.size(0)
-                    predicted = (outputs >= 0.5).float()
+                    predicted = (torch.sigmoid(outputs) >= 0.5).float()
                     val_correct += (predicted == targets).sum().item()
                     val_samples += inputs.size(0)
                     
@@ -345,7 +344,10 @@ class RegressionDLNN:
         
         # Make prediction
         with torch.no_grad():
-            confidences = self.model(X_tensor).cpu().numpy()
+            # Get raw logits from model
+            logits = self.model(X_tensor)
+            # Apply sigmoid to get probabilities
+            confidences = torch.sigmoid(logits).cpu().numpy()
         
         # Convert to binary output with confidence
         predictions = (confidences >= 0.5).astype(int)
