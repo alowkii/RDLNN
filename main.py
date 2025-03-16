@@ -14,6 +14,7 @@ from modules.rdlnn import RegressionDLNN
 from modules.data_handling import precompute_features, load_and_verify_features
 from modules.preprocessing import preprocess_image
 
+# Improved signal_handler in main.py
 def signal_handler(sig, frame):
     """
     Handle signals for graceful shutdown
@@ -24,13 +25,22 @@ def signal_handler(sig, frame):
         frame: Current stack frame
     """
     print('Cleaning up resources before exit...')
+    
+    # Flush any open file handles
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
+    # Clean up CUDA resources if available
     if torch.cuda.is_available():
         # Synchronize all CUDA streams first
         torch.cuda.synchronize()
         # Then empty cache
         torch.cuda.empty_cache()
+    
     # Collect Python garbage
     gc.collect()
+    
+    print('Cleanup complete. Exiting...')
     sys.exit(0)
 
 # Register signal handlers
