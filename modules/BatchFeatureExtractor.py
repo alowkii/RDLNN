@@ -224,17 +224,25 @@ class OptimizedBatchProcessor:
             
             # Make predictions with mixed precision
             with torch.no_grad(), torch.cuda.stream(self.streams['predict']), \
-                 torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
+                torch.amp.autocast(device_type='cuda',enabled=self.use_fp16):
                 confidences = self.model.model(features).squeeze(-1)
             
             # Convert to binary predictions
             predictions = (confidences >= 0.5).float()
+            
+            # Clean up CUDA tensors
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
             
             # Return as numpy arrays
             return predictions.cpu().numpy(), confidences.cpu().numpy()
             
         except Exception as e:
             print(f"Error during batch prediction: {e}")
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
             return None, None
             
     def process_directory(self, directory, results_file=None):

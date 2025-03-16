@@ -15,9 +15,21 @@ from modules.data_handling import precompute_features, load_and_verify_features
 from modules.preprocessing import preprocess_image
 
 def signal_handler(sig, frame):
+    """
+    Handle signals for graceful shutdown
+    Ensures proper CUDA cleanup before exit
+    
+    Args:
+        sig: Signal number
+        frame: Current stack frame
+    """
     print('Cleaning up resources before exit...')
     if torch.cuda.is_available():
+        # Synchronize all CUDA streams first
+        torch.cuda.synchronize()
+        # Then empty cache
         torch.cuda.empty_cache()
+    # Collect Python garbage
     gc.collect()
     sys.exit(0)
 

@@ -28,15 +28,20 @@ class RegressionDLNN:
         # Check if CUDA is available
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Define the model architecture
+        # Define the model architecture with improved layers
         self.model = nn.Sequential(
             # Input layer
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            
+            # Hidden layers
+            nn.Linear(128, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Dropout(0.3),
             
-            # Hidden layer
             nn.Linear(64, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(),
@@ -104,6 +109,15 @@ class RegressionDLNN:
             patience=5,
         )
         
+        # Initialize warmup scheduler
+        warmup_epochs = min(5, epochs // 5)  # 20% of total epochs or max 5
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            self.optimizer, 
+            start_factor=0.1, 
+            end_factor=1.0, 
+            total_iters=warmup_epochs
+        )
+        
         # Ensure we're working with numpy arrays for the preprocessing steps
         if isinstance(X, torch.Tensor):
             X_np = X.cpu().numpy()
@@ -118,6 +132,24 @@ class RegressionDLNN:
         # Properly reshape y if needed
         if len(y_np.shape) == 1:
             y_np = y_np.reshape(-1, 1)
+            
+        # Handle class imbalance by using class weights
+        unique_classes = np.unique(y_np)
+        class_counts = np.bincount(y_np.flatten().astype(int))
+        total_samples = len(y_np)
+        
+        # Calculate class weights inversely proportional to class frequencies
+        class_weights = {}
+        for i, count in enumerate(class_counts):
+            class_weights[i] = total_samples / (len(unique_classes) * count)
+        
+        # Print class weights
+        print(f"Class weights: {class_weights}")
+        
+        # Update loss function to use weights
+        self.loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([class_weights[1]/class_weights[0]], device=self.device)
+        )
             
         # Split data into training and validation sets using sklearn to ensure balance
         X_train, X_val, y_train, y_val = train_test_split(
@@ -265,8 +297,11 @@ class RegressionDLNN:
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0
             f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
             
-            # Update learning rate scheduler
-            self.scheduler.step(avg_val_loss)
+            # Update learning rate based on epoch
+            if epoch < warmup_epochs:
+                warmup_scheduler.step()
+            else:
+                self.scheduler.step(avg_val_loss)
             
             # Early stopping check
             if avg_val_loss < best_val_loss:
@@ -296,20 +331,22 @@ class RegressionDLNN:
             
             # Print progress with detailed metrics
             print(f"Epoch {epoch+1}/{epochs} - "
-                  f"time: {epoch_time:.2f}s - "
-                  f"loss: {avg_train_loss:.4f} - acc: {train_accuracy:.4f} - "
-                  f"val_loss: {avg_val_loss:.4f} - val_acc: {val_accuracy:.4f}")
+                f"time: {epoch_time:.2f}s - "
+                f"loss: {avg_train_loss:.4f} - acc: {train_accuracy:.4f} - "
+                f"val_loss: {avg_val_loss:.4f} - val_acc: {val_accuracy:.4f}")
             print(f"Confusion Matrix - TP: {tp}, TN: {tn}, FP: {fp}, FN: {fn}")
             print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}\n")
             
             # Periodically clear CUDA cache
             if self.device.type == 'cuda' and epoch % 5 == 0:
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
                 gc.collect()
         
         # Final cleanup
         if best_model_state:
             if self.device.type == 'cuda':
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
             gc.collect()
         
