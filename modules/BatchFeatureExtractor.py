@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import gc
 from modules.preprocessing import preprocess_image
 from modules.image_decomposition import polar_dyadic_wavelet_transform
-from modules.featureExtraction import BatchFeatureExtractor
+from modules.feature_extraction import BatchFeatureExtractor
 
 class OptimizedBatchProcessor:
     """

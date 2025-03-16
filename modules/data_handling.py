@@ -4,7 +4,7 @@ import torch
 from concurrent.futures import ThreadPoolExecutor
 from modules.preprocessing import preprocess_image
 from modules.image_decomposition import polar_dyadic_wavelet_transform
-from modules.featureExtraction import BatchFeatureExtractor
+from modules.feature_extraction import BatchFeatureExtractor
 from tqdm import tqdm
 
 def precompute_features(directory, label=None, batch_size=16, num_workers=4, use_fp16=True, save_path=None):
