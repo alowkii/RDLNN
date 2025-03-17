@@ -25,6 +25,10 @@ from modules.feature_extraction import extract_features_from_wavelet
 from modules.batch_processor import OptimizedBatchProcessor
 from modules.utils import setup_signal_handlers, plot_training_history, setup_logging, logger
 
+# Import training methods
+from training.balanced import train_with_balanced_sampling, train_with_oversampling, combined_approach
+from training.precision import precision_tuned_training
+
 def main():
     """Main entry point for the application"""
     # Parse command line arguments
@@ -82,17 +86,17 @@ def parse_arguments() -> argparse.Namespace:
     
     parser.add_argument('--output_dir', 
                         type=str, 
-                        default='results',
+                        default='data/results',
                         help='Directory to save results')
     
     parser.add_argument('--model_path', 
                         type=str, 
-                        default='models/forgery_detection_model.pth',
+                        default='data/models/forgery_detection_model.pth',
                         help='Path to save/load model')
     
     parser.add_argument('--features_path', 
                         type=str, 
-                        default='features/precomputed_features.npz',
+                        default='data/features/precomputed_features.npz',
                         help='Path to save/load precomputed features')
     
     parser.add_argument('--batch_size', 
@@ -127,6 +131,17 @@ def parse_arguments() -> argparse.Namespace:
                         default=0.001,
                         help='Learning rate for training')
     
+    parser.add_argument('--training_method',
+                        type=str,
+                        choices=['balanced', 'oversampling', 'combined', 'precision'],
+                        default='precision',
+                        help='Training method to use')
+    
+    parser.add_argument('--threshold',
+                        type=float,
+                        default=0.8,
+                        help='Classification threshold for precision-tuned model')
+    
     parser.add_argument('--debug', 
                         action='store_true', 
                         help='Enable debug mode with additional logging')
@@ -134,7 +149,6 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 def precompute_mode(args: argparse.Namespace) -> None:
-    import numpy as np
     """Precompute features for training or testing
     
     Args:
@@ -181,35 +195,14 @@ def precompute_mode(args: argparse.Namespace) -> None:
     if args.authentic_dir and args.forged_dir:
         logger.info("Combining authentic and forged features...")
         
-        # Load the individual feature files
-        authentic_data = np.load(f"{os.path.splitext(args.features_path)[0]}_authentic.npz", allow_pickle=True)
-        forged_data = np.load(f"{os.path.splitext(args.features_path)[0]}_forged.npz", allow_pickle=True)
-
-        # Extract data
-        authentic_features = authentic_data['features']
-        authentic_paths = authentic_data['paths']
-        authentic_labels = authentic_data['labels']  # Should be all 0s
-
-        forged_features = forged_data['features']
-        forged_paths = forged_data['paths']
-        forged_labels = forged_data['labels']  # Should be all 1s
-
-        # Combine the data
-        combined_features = np.vstack([authentic_features, forged_features])
-        combined_paths = list(authentic_paths) + list(forged_paths)
-        combined_labels = list(authentic_labels) + list(forged_labels)
+        # Import combine_features function
+        from tools.combine_features import combine_feature_files
         
-        # Save combined data
-        np.savez(
-            args.features_path,
-            features=combined_features,
-            paths=combined_paths,
-            labels=combined_labels
-        )
+        # Combine the files
+        authentic_path = f"{os.path.splitext(args.features_path)[0]}_authentic.npz"
+        forged_path = f"{os.path.splitext(args.features_path)[0]}_forged.npz"
         
-        logger.info(f"Saved combined features to {args.features_path}")
-        logger.info(f"Combined dataset: {len(combined_features)} samples "
-              f"({len(authentic_features)} authentic, {len(forged_features)} forged)")
+        combine_feature_files(authentic_path, forged_path, args.features_path)
 
 def train_mode(args: argparse.Namespace) -> None:
     """Train the model using precomputed features
@@ -217,8 +210,6 @@ def train_mode(args: argparse.Namespace) -> None:
     Args:
         args: Command line arguments
     """
-    import numpy as np
-    
     if not (args.authentic_dir and args.forged_dir) and not os.path.exists(args.features_path):
         logger.error("For training, either provide authentic_dir and forged_dir arguments, "
               "or precompute features first and provide features_path.")
@@ -229,44 +220,50 @@ def train_mode(args: argparse.Namespace) -> None:
         logger.info("Precomputing features for training...")
         precompute_mode(args)
     
-    # Load and verify features
-    features, labels, paths = load_and_verify_features(args.features_path)
-    
-    if len(features) == 0:
-        logger.error("No valid features found. Please check your data.")
-        return
-    
-    if len(labels) == 0:
-        logger.error("No labels found. Please make sure your feature file includes labels.")
-        return
-    
-    # Check class balance
-    class_counts = np.bincount(labels.astype(int))
-    if len(class_counts) < 2:
-        logger.error(f"Only found {len(class_counts)} classes. Need at least 2 classes for training.")
-        return
-    
-    # Create and train the model
-    input_dim = features.shape[1]
-    logger.info(f"Creating model with input dimension: {input_dim}")
-    model = RegressionDLNN(input_dim)
-    
-    # Train the model
-    history = model.fit(
-        features, labels, 
-        epochs=args.epochs, 
-        learning_rate=args.learning_rate,
-        batch_size=args.batch_size,
-        validation_split=0.2,
-        early_stopping=5,
-        use_fp16=args.fp16
-    )
-    
-    # Save the model
-    model.save(args.model_path)
-    
-    # Plot training history
-    plot_training_history(history, args.output_dir)
+    # Use the selected training method
+    if args.training_method == 'balanced':
+        logger.info("Using balanced training method with weighted sampling")
+        train_with_balanced_sampling(
+            args.features_path,
+            args.model_path,
+            args.output_dir,
+            args.epochs,
+            args.learning_rate,
+            args.batch_size
+        )
+    elif args.training_method == 'oversampling':
+        logger.info("Using oversampling training method")
+        train_with_oversampling(
+            args.features_path,
+            args.model_path,
+            args.output_dir,
+            args.epochs,
+            args.learning_rate,
+            args.batch_size
+        )
+    elif args.training_method == 'combined':
+        logger.info("Using combined training method (oversampling + class weights)")
+        combined_approach(
+            args.features_path,
+            args.model_path,
+            args.output_dir,
+            args.epochs,
+            args.learning_rate,
+            args.batch_size
+        )
+    elif args.training_method == 'precision':
+        logger.info(f"Using precision-tuned training method with threshold {args.threshold}")
+        precision_tuned_training(
+            args.features_path,
+            args.model_path,
+            args.output_dir,
+            epochs=args.epochs, 
+            learning_rate=args.learning_rate,
+            batch_size=args.batch_size,
+            threshold=args.threshold
+        )
+    else:
+        logger.error(f"Unknown training method: {args.training_method}")
 
 def test_mode(args: argparse.Namespace) -> None:
     """Test the model on images in the input directory
@@ -286,6 +283,10 @@ def test_mode(args: argparse.Namespace) -> None:
     
     # Load the model
     model = RegressionDLNN.load(args.model_path)
+    
+    # Check if model has a custom threshold
+    threshold = getattr(model, 'threshold', 0.5)
+    logger.info(f"Using classification threshold: {threshold}")
     
     # Precompute features if not already done
     features_file = args.features_path
@@ -308,7 +309,11 @@ def test_mode(args: argparse.Namespace) -> None:
     
     # Make predictions
     start_time = time.time()
-    predictions, confidences = model.predict(test_features)
+    _, confidences = model.predict(test_features)
+    
+    # Apply custom threshold if available
+    predictions = (confidences >= threshold).astype(int)
+    
     elapsed_time = time.time() - start_time
     
     # Process results
@@ -398,6 +403,10 @@ def test_single_image(args: argparse.Namespace) -> None:
     # Load the model
     model = RegressionDLNN.load(args.model_path)
     
+    # Check if model has a custom threshold
+    threshold = getattr(model, 'threshold', 0.5)
+    logger.info(f"Using classification threshold: {threshold}")
+    
     # Process the image
     logger.info(f"Processing single image: {args.image_path}")
     start_time = time.time()
@@ -431,15 +440,16 @@ def test_single_image(args: argparse.Namespace) -> None:
             return
         
         # Make prediction
-        predictions, confidences = model.predict(feature_vector.cpu().numpy())
+        _, confidences = model.predict(feature_vector.cpu().numpy())
         
-        # Display results
-        prediction = predictions[0]
+        # Apply threshold
+        prediction = 1 if confidences[0] >= threshold else 0
         confidence = confidences[0]
         result = "FORGED" if prediction == 1 else "AUTHENTIC"
         
         logger.info(f"\nResult: {result}")
         logger.info(f"Confidence: {confidence:.4f}")
+        logger.info(f"Threshold: {threshold}")
         
         # Save the result
         result_file = os.path.join(args.output_dir, f"{os.path.splitext(os.path.basename(args.image_path))[0]}_result.txt")
@@ -447,6 +457,7 @@ def test_single_image(args: argparse.Namespace) -> None:
             f.write(f"Image: {args.image_path}\n")
             f.write(f"Result: {result}\n")
             f.write(f"Confidence: {confidence:.4f}\n")
+            f.write(f"Threshold: {threshold}\n")
         
         logger.info(f"Result saved to {result_file}")
         

@@ -39,11 +39,10 @@ venv.bak/
 *.code-workspace
 
 # Data and model directories
-/Data/
 /data/
-/features/
-/models/
-/results/
+/data/features/
+/data/models/
+/data/results/
 
 # Jupyter notebook files
 .ipynb_checkpoints/
