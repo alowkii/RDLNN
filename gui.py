@@ -144,7 +144,7 @@ class ForgeryDetectionGUI:
         self.epochs_var = tk.IntVar(value=25)
         self.learning_rate_var = tk.DoubleVar(value=0.001)
         self.batch_size_var = tk.IntVar(value=32)
-        self.threshold_var = tk.DoubleVar(value=0.75)
+        self.threshold_var = tk.DoubleVar(value=0.7)
         self.use_fp16_var = tk.BooleanVar(value=True)
         self.workers_var = tk.IntVar(value=4)
         
