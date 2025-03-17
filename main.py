@@ -134,6 +134,7 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 def precompute_mode(args: argparse.Namespace) -> None:
+    import numpy as np
     """Precompute features for training or testing
     
     Args:
@@ -183,18 +184,17 @@ def precompute_mode(args: argparse.Namespace) -> None:
         # Load the individual feature files
         authentic_data = np.load(f"{os.path.splitext(args.features_path)[0]}_authentic.npz", allow_pickle=True)
         forged_data = np.load(f"{os.path.splitext(args.features_path)[0]}_forged.npz", allow_pickle=True)
-        
+
         # Extract data
         authentic_features = authentic_data['features']
         authentic_paths = authentic_data['paths']
-        authentic_labels = authentic_data['labels']
-        
+        authentic_labels = authentic_data['labels']  # Should be all 0s
+
         forged_features = forged_data['features']
         forged_paths = forged_data['paths']
-        forged_labels = forged_data['labels']
-        
+        forged_labels = forged_data['labels']  # Should be all 1s
+
         # Combine the data
-        import numpy as np
         combined_features = np.vstack([authentic_features, forged_features])
         combined_paths = list(authentic_paths) + list(forged_paths)
         combined_labels = list(authentic_labels) + list(forged_labels)

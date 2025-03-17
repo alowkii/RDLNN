@@ -70,7 +70,7 @@ class RegressionDLNN:
         self.scaler = StandardScaler()
         
         # Initialize gradient scaler for mixed precision training
-        self.scaler_amp = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        self.scaler_amp = torch.amp.GradScaler("cuda") if torch.cuda.is_available() else None
         
         # Print device information
         if torch.cuda.is_available():
@@ -243,7 +243,7 @@ class RegressionDLNN:
                 # Forward and backward pass
                 if use_fp16 and self.device.type == 'cuda':
                     # Using mixed precision
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast("cuda"):
                         outputs = self.model(inputs)
                         loss = self.loss_fn(outputs, targets)
                     
@@ -302,7 +302,7 @@ class RegressionDLNN:
                     targets = targets.to(self.device)
                     
                     if use_fp16 and self.device.type == 'cuda':
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast("cuda"):
                             outputs = self.model(inputs)
                             loss = self.loss_fn(outputs, targets)
                     else:
@@ -357,7 +357,7 @@ class RegressionDLNN:
                 early_stopping_counter = 0
                 # Save best model state
                 best_model_state = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
-                logger.info(f"✓ New best validation loss: {best_val_loss:.6f}")
+                logger.info(f"[OK] New best validation loss: {best_val_loss:.6f}")
             else:
                 early_stopping_counter += 1
                 logger.info(f"! Validation loss did not improve. Early stopping counter: {early_stopping_counter}/{early_stopping}")
