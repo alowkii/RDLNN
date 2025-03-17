@@ -58,8 +58,8 @@ class ForgeryDetectionGUI:
         
         # Set theme
         style = ttk.Style()
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
+        if "default" in style.theme_names():
+            style.theme_use("default")
         
         self.create_variables()
         self.create_widgets()
