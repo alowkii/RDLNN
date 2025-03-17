@@ -56,10 +56,64 @@ class ForgeryDetectionGUI:
         root.geometry("1024x768")
         root.minsize(800, 600)
         
-        # Set theme
+        # Set theme and configure styles
         style = ttk.Style()
-        if "default" in style.theme_names():
-            style.theme_use("default")
+        style.theme_use("default")
+        
+        # Configure colors
+        primary_color = "#0D0D0D"       # Button color
+        secondary_color = "#404040"     # Button Hover color
+        accent_color = "#0D0D0D"        # Dk
+        bg_color = "#D9D9D9"            # background color
+        text_color = "#0D0D0D"          # text color
+        
+        # Configure common styles
+        style.configure("TFrame", background=bg_color)
+        style.configure("TLabelframe", background=bg_color, foreground=text_color)
+        style.configure("TLabelframe.Label", background=bg_color, foreground=text_color, font=("Arial", 10, "bold"))
+        style.configure("TLabel", background=bg_color, foreground=text_color)
+        style.configure("TButton", background=primary_color, foreground="white", font=("Arial", 9, "bold"))
+        style.map("TButton", 
+                  background=[("active", secondary_color), ("disabled", "#cccccc")],
+                  foreground=[("active", "white"), ("disabled", "#999999")])
+        
+        # Configure notebook styles
+        style.configure("TNotebook", background=bg_color, tabmargins=[2, 5, 2, 0])
+        style.configure("TNotebook.Tab", background="#dddddd", foreground=text_color, padding=[10, 2], font=("Arial", 9))
+        style.map("TNotebook.Tab",
+                  background=[("selected", primary_color)],
+                  foreground=[("selected", "white")],
+                  expand=[("selected", [1, 1, 1, 0])])
+        
+        # Configure progressbar
+        style.configure("TProgressbar", 
+                        troughcolor=bg_color, 
+                        background=secondary_color, 
+                        thickness=8)
+        
+        # Configure entry styles
+        style.configure("TEntry", foreground=text_color, fieldbackground="white")
+        
+        # Configure checkbutton
+        style.configure("TCheckbutton", background=bg_color, foreground=text_color)
+        style.map("TCheckbutton", 
+                  background=[("active", bg_color)],
+                  indicatorcolor=[("selected", primary_color)])
+        
+        # Configure combobox
+        style.configure("TCombobox", 
+                       foreground=text_color,
+                       fieldbackground="white")
+        style.map("TCombobox", 
+                  fieldbackground=[("readonly", "white")],
+                  selectbackground=[("readonly", primary_color)])
+        
+        # Change the canvas background
+        self.canvas_bg = "#ffffff"  # White
+        
+        # Result colors
+        self.authentic_color = secondary_color  # Green for authentic
+        self.forged_color = accent_color  # Red for forged
         
         self.create_variables()
         self.create_widgets()
@@ -101,6 +155,9 @@ class ForgeryDetectionGUI:
         # For image preview
         self.current_image = None
         self.current_image_result = None
+
+        # Create formatter for log messages
+        self.formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         
     def create_widgets(self):
         """Create all widgets for the GUI"""
