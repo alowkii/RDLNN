@@ -9,6 +9,7 @@ import signal
 import logging
 import matplotlib.pyplot as plt
 from typing import Dict, Any, Optional
+import torch
 
 # Set up logging
 logger = logging.getLogger('forgery_detection')
