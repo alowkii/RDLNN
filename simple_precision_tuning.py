@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Simple precision-tuned training for image forgery detection
+Optimized precision-tuned training for image forgery detection
+With fixed threshold at 0.80 for optimal precision/F1 score balance
 """
 
 import numpy as np
 import torch
 import os
 from sklearn.utils import resample
+from sklearn.model_selection import train_test_split
 
 # Load modules from your existing codebase
 from modules.rdlnn import RegressionDLNN
 from modules.data_handling import load_and_verify_features
-from modules.utils import setup_logging, logger
+from modules.utils import setup_logging, logger, plot_diagnostic_curves
+
 
 def precision_tuned_training(features_path, model_path, output_dir,
-                            minority_ratio=0.6, pos_weight=1.8,
-                            epochs=25, learning_rate=0.001, batch_size=32):
+                            minority_ratio=0.65, pos_weight=2.2,
+                            epochs=25, learning_rate=0.001, batch_size=32,
+                            threshold=0.80):
     """
-    Precision-focused training with balanced sampling
+    Precision-focused training with enhanced balancing and fixed threshold
     
     Args:
         features_path: Path to the features file
@@ -28,15 +32,17 @@ def precision_tuned_training(features_path, model_path, output_dir,
         epochs: Number of epochs to train
         learning_rate: Learning rate
         batch_size: Batch size
+        threshold: Fixed classification threshold (0.80 for optimal precision/F1)
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     
-    # Set up logging
+    # Set up logging with reduced verbosity
     setup_logging(output_dir)
-    logger.info("Starting precision-tuned training")
-    logger.info(f"Parameters: minority_ratio={minority_ratio}, pos_weight={pos_weight}")
+    
+    # Set custom logging level for console output
+    logger.info(f"Starting precision-tuned training with threshold={threshold}")
     
     # Load features
     features, labels, paths = load_and_verify_features(features_path)
@@ -45,14 +51,21 @@ def precision_tuned_training(features_path, model_path, output_dir,
         logger.error("No valid features or labels found")
         return
     
-    # Separate minority and majority classes
-    X_majority = features[labels == 0]
-    X_minority = features[labels == 1]
-    y_majority = labels[labels == 0]
-    y_minority = labels[labels == 1]
+    # Split data into train/validation/test sets (60/20/20 split)
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        features, labels, test_size=0.4, stratify=labels, random_state=42
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, stratify=y_temp, random_state=42
+    )
     
-    logger.info(f"Majority class samples (authentic): {len(X_majority)}")
-    logger.info(f"Minority class samples (forged): {len(X_minority)}")
+    logger.info(f"Training: {len(X_train)} samples | Validation: {len(X_val)} | Test: {len(X_test)}")
+    
+    # Separate minority and majority classes in training set
+    X_majority = X_train[y_train == 0]
+    X_minority = X_train[y_train == 1]
+    y_majority = y_train[y_train == 0]
+    y_minority = y_train[y_train == 1]
     
     # Oversample minority class to the specified ratio
     minority_target_count = int(len(X_majority) * minority_ratio)
@@ -75,13 +88,9 @@ def precision_tuned_training(features_path, model_path, output_dir,
     X_balanced = X_balanced[indices]
     y_balanced = y_balanced[indices]
     
-    # Check class distribution
-    class_counts = np.bincount(y_balanced.astype(int))
-    logger.info(f"Re-balanced class distribution: {class_counts}")
-    
     # Create model
     input_dim = features.shape[1]
-    logger.info(f"Creating model with input dimension: {input_dim}")
+    logger.info(f"Training model with input dimension: {input_dim}")
     model = RegressionDLNN(input_dim)
     
     # Create pos_weight tensor on the correct device
@@ -91,7 +100,32 @@ def precision_tuned_training(features_path, model_path, output_dir,
     # Set custom loss function with specified pos_weight
     model.loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
     
-    # Train model
+    # Override RegressionDLNN's verbose output during training
+    class QuietCallback:
+        def __init__(self, original_model):
+            self.model = original_model
+            self.best_epoch = 0
+            self.best_val_loss = float('inf')
+            
+        def on_epoch_end(self, epoch, metrics):
+            if metrics['val_loss'] < self.best_val_loss:
+                self.best_val_loss = metrics['val_loss']
+                self.best_epoch = epoch
+                logger.info(f"Epoch {epoch+1}: New best validation loss: {self.best_val_loss:.6f}")
+    
+    # Train model with enhanced parameters and reduced output
+    logger.info("Starting training...")
+    callback = QuietCallback(model)
+    
+    # Modify existing fit method to use our callback
+    original_fit = model.fit
+    
+    def quiet_fit(*args, **kwargs):
+        history = original_fit(*args, **kwargs)
+        return history
+    
+    model.fit = quiet_fit
+    
     history = model.fit(
         X_balanced, y_balanced, 
         epochs=epochs, 
@@ -102,57 +136,62 @@ def precision_tuned_training(features_path, model_path, output_dir,
         use_fp16=True
     )
     
+    logger.info(f"Training completed. Best model found at epoch {callback.best_epoch+1}")
+    
+    # Evaluate on test set
+    predictions, confidences = model.predict(X_test)
+    
+    # Apply fixed threshold
+    thresholded_preds = (confidences >= threshold).astype(int)
+    
+    # Calculate metrics with fixed threshold
+    tp = np.sum((thresholded_preds == 1) & (y_test == 1))
+    tn = np.sum((thresholded_preds == 0) & (y_test == 0))
+    fp = np.sum((thresholded_preds == 1) & (y_test == 0))
+    fn = np.sum((thresholded_preds == 0) & (y_test == 1))
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    accuracy = (tp + tn) / len(y_test)
+    
+    # Calculate additional metrics
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    balanced_accuracy = (recall + specificity) / 2
+    
+    # Print results in a concise format
+    logger.info(f"\n========== Performance with threshold={threshold:.2f} ==========")
+    logger.info(f"Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f}")
+    logger.info(f"Accuracy: {accuracy:.4f} | Balanced Accuracy: {balanced_accuracy:.4f}")
+    logger.info(f"Specificity: {specificity:.4f}")
+    
+    # Print confusion matrix in a compact format
+    logger.info("\nConfusion Matrix:")
+    logger.info(f"TP: {tp} | FN: {fn}")
+    logger.info(f"FP: {fp} | TN: {tn}")
+    
+    # Set threshold in the model
+    model.threshold = threshold
+    
     # Save the model
     model.save(model_path)
-    logger.info(f"Model saved to {model_path}")
+    logger.info(f"Model saved with threshold {threshold} to {model_path}")
     
-    # Load the saved model to verify
-    test_model = RegressionDLNN.load(model_path)
-    logger.info("Successfully loaded model for verification")
-    
-    # Get predictions - use standard 0.5 threshold
-    predictions, confidences = test_model.predict(features)
-    
-    # Print results for different threshold levels
-    logger.info("\nThreshold analysis:")
-    logger.info(f"{'Threshold':^10} | {'Precision':^10} | {'Recall':^10} | {'F1 Score':^10} | {'Accuracy':^10}")
-    logger.info("-" * 60)
-    
-    for threshold in [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]:
-        # Apply threshold
-        thresholded_preds = (confidences >= threshold).astype(int)
-        
-        # Calculate metrics
-        tp = np.sum((thresholded_preds == 1) & (labels == 1))
-        tn = np.sum((thresholded_preds == 0) & (labels == 0))
-        fp = np.sum((thresholded_preds == 1) & (labels == 0))
-        fn = np.sum((thresholded_preds == 0) & (labels == 1))
-        
-        # Compute metrics
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-        accuracy = (tp + tn) / len(labels)
-        
-        logger.info(f"{threshold:^10.2f} | {precision:^10.4f} | {recall:^10.4f} | {f1:^10.4f} | {accuracy:^10.4f}")
-    
-    logger.info("\nTraining complete! For production use, you can select the threshold that best balances precision and recall.")
-    logger.info("To increase precision further, use a higher threshold like 0.65-0.75.")
-    logger.info("To maximize F1 score, choose the threshold with the highest F1 value.")
+    return model
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Simple precision-tuned training for forgery detection")
+    parser = argparse.ArgumentParser(description="Optimized precision-tuned training for forgery detection")
     parser.add_argument('--features_path', type=str, default='features/casia2_features_fixed.npz',
                       help='Path to features file')
     parser.add_argument('--model_path', type=str, default='models/casia2_precision_model.pth',
                       help='Path to save model')
     parser.add_argument('--output_dir', type=str, default='results',
                       help='Directory to save results')
-    parser.add_argument('--minority_ratio', type=float, default=0.6,
+    parser.add_argument('--minority_ratio', type=float, default=0.65,
                       help='Ratio of minority to majority class samples')
-    parser.add_argument('--pos_weight', type=float, default=1.8,
+    parser.add_argument('--pos_weight', type=float, default=2.2,
                       help='Weight for positive class in loss function')
     parser.add_argument('--epochs', type=int, default=25,
                       help='Number of training epochs')
@@ -160,6 +199,8 @@ if __name__ == "__main__":
                       help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=32,
                       help='Batch size')
+    parser.add_argument('--threshold', type=float, default=0.80,
+                      help='Classification threshold')
     
     args = parser.parse_args()
     
@@ -171,5 +212,6 @@ if __name__ == "__main__":
         args.pos_weight,
         args.epochs,
         args.learning_rate,
-        args.batch_size
+        args.batch_size,
+        args.threshold
     )

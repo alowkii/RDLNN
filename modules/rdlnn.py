@@ -529,7 +529,7 @@ class RegressionDLNN:
         Returns:
             Loaded RegressionDLNN model
         """
-        checkpoint = torch.load(filepath, map_location='cpu')
+        checkpoint = torch.load(filepath, map_location='cpu', weights_only=False)
         
         # Get input dimension from checkpoint
         input_dim = checkpoint.get('input_dim')
