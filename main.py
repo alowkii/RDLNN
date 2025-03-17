@@ -138,9 +138,9 @@ def parse_arguments() -> argparse.Namespace:
                         help='Training method to use')
     
     parser.add_argument('--threshold',
-                        type=float,
-                        default=0.8,
-                        help='Classification threshold for precision-tuned model')
+                    type=float,
+                    default=None,
+                    help='Override classification threshold (default: use model\'s threshold or 0.5)')
     
     parser.add_argument('--debug', 
                         action='store_true', 
@@ -406,6 +406,11 @@ def test_single_image(args: argparse.Namespace) -> None:
     # Check if model has a custom threshold
     threshold = getattr(model, 'threshold', 0.5)
     logger.info(f"Using classification threshold: {threshold}")
+
+    if args.threshold:
+        threshold = args.threshold
+        logger.info(f"Overriding with command threshold: {threshold}")
+                                                                     
     
     # Process the image
     logger.info(f"Processing single image: {args.image_path}")

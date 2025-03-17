@@ -508,27 +508,26 @@ class RegressionDLNN:
         """Save the model to disk"""
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         
-        # Save model state, scaler, and metadata
-        torch.save({
+        # Save model state, scaler, threshold, and metadata
+        save_dict = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict() if hasattr(self, 'optimizer') else None,
             'scheduler_state_dict': self.scheduler.state_dict() if hasattr(self, 'scheduler') else None,
             'scaler': self.scaler,
             'input_dim': self.model[0].in_features,
-        }, filepath)
+        }
+        
+        # Add threshold if it exists
+        if hasattr(self, 'threshold'):
+            save_dict['threshold'] = self.threshold
+        
+        torch.save(save_dict, filepath)
         
         logger.info(f"Model saved to {filepath}")
 
     @classmethod
     def load(cls, filepath: str) -> 'RegressionDLNN':
-        """Load a trained model from disk
-        
-        Args:
-            filepath: Path to saved model file
-            
-        Returns:
-            Loaded RegressionDLNN model
-        """
+        """Load a trained model from disk"""
         checkpoint = torch.load(filepath, map_location='cpu', weights_only=False)
         
         # Get input dimension from checkpoint
@@ -544,6 +543,10 @@ class RegressionDLNN:
 
         # Load scaler
         model.scaler = checkpoint['scaler']
+
+        # Load threshold if it exists
+        if 'threshold' in checkpoint:
+            model.threshold = checkpoint['threshold']
 
         # Move model to the correct device after loading
         model.model = model.model.to(model.device)
