@@ -14,6 +14,7 @@ import gc
 import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
+import numpy as np
 
 # Import modules
 from modules.rdlnn import RegressionDLNN
