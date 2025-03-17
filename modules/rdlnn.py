@@ -42,7 +42,7 @@ class RegressionDLNN:
             # Input layer with larger size
             nn.Linear(input_dim, 256),
             nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.1),  # Use LeakyReLU for better gradient flow
+            nn.LeakyReLU(0.1),
             nn.Dropout(0.5),
             
             # Hidden layers
